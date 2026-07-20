@@ -1,0 +1,162 @@
+#!/usr/bin/env python3
+"""Approval-gated Codex MCP carrier for one host command."""
+
+import json
+import os
+import pathlib
+import subprocess
+import sys
+
+
+TOOL = {
+    "name": "run_as_user",
+    "description": "Run one shell command as the invoking user with the saved invocation environment and requested working directory.",
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "command": {"type": "string"},
+            "working_directory": {"type": "string"},
+        },
+        "required": ["command", "working_directory"],
+        "additionalProperties": False,
+    },
+    "annotations": {
+        "title": "Run command as user",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+}
+
+
+def reply(request_id, result):
+    sys.stdout.write(
+        json.dumps({"jsonrpc": "2.0", "id": request_id, "result": result}) + "\n"
+    )
+    sys.stdout.flush()
+
+
+def tool_error(request_id, message):
+    reply(
+        request_id,
+        {
+            "content": [{"type": "text", "text": message}],
+            "structuredContent": {"error": message},
+            "isError": True,
+        },
+    )
+
+
+def load_environment(path):
+    entries = pathlib.Path(path).read_bytes().split(b"\0")
+    environment = {}
+    for entry in entries:
+        if not entry:
+            continue
+        if b"=" not in entry:
+            raise ValueError("environment snapshot contains an entry without '='")
+        name, value = entry.split(b"=", 1)
+        if not name or b"\0" in name or b"=" in name:
+            raise ValueError("environment snapshot contains an invalid name")
+        environment[name] = value
+    return environment
+
+
+def run_as_user(request_id, arguments, invocation_environment):
+    command = arguments.get("command")
+    working_directory = arguments.get("working_directory")
+    if not isinstance(command, str) or not command:
+        tool_error(request_id, "command must be a non-empty string")
+        return
+    if not isinstance(working_directory, str) or not working_directory:
+        tool_error(request_id, "working_directory must be a non-empty string")
+        return
+    cwd = pathlib.Path(working_directory)
+    if not cwd.is_absolute() or not cwd.is_dir():
+        tool_error(request_id, "working_directory must be an existing absolute directory")
+        return
+
+    environment = invocation_environment.copy()
+    environment[b"PWD"] = os.fsencode(working_directory)
+    shell = os.fsdecode(environment.get(b"SHELL", b"/bin/sh"))
+    try:
+        completed = subprocess.run(
+            [shell, "-c", command],
+            cwd=working_directory,
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+    except OSError as exc:
+        tool_error(request_id, f"could not start command: {exc}")
+        return
+
+    signal = -completed.returncode if completed.returncode < 0 else None
+    exit_status = completed.returncode if completed.returncode >= 0 else None
+    result = {
+        "stdout": completed.stdout,
+        "stderr": completed.stderr,
+        "exit_status": exit_status,
+        "signal": signal,
+    }
+    reply(
+        request_id,
+        {
+            "content": [
+                {"type": "text", "text": completed.stdout},
+                {"type": "text", "text": completed.stderr},
+            ],
+            "structuredContent": result,
+            "isError": completed.returncode != 0,
+        },
+    )
+
+
+def main():
+    if len(sys.argv) != 2:
+        print("usage: agents-run-as-user ENVIRONMENT_SNAPSHOT", file=sys.stderr)
+        return 2
+    try:
+        invocation_environment = load_environment(sys.argv[1])
+    except (OSError, ValueError) as exc:
+        print(f"agents-run-as-user: invalid environment snapshot: {exc}", file=sys.stderr)
+        return 2
+
+    for raw_line in sys.stdin:
+        line = raw_line.strip()
+        if not line:
+            continue
+        message = json.loads(line)
+        method = message.get("method")
+        request_id = message.get("id")
+        if method == "initialize":
+            reply(
+                request_id,
+                {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "agents-run-as-user", "version": "1"},
+                },
+            )
+        elif method == "tools/list":
+            reply(request_id, {"tools": [TOOL]})
+        elif method == "tools/call":
+            if message.get("params", {}).get("name") != TOOL["name"]:
+                tool_error(request_id, "unknown tool")
+                continue
+            arguments = message.get("params", {}).get("arguments", {})
+            if not isinstance(arguments, dict):
+                tool_error(request_id, "arguments must be an object")
+                continue
+            run_as_user(request_id, arguments, invocation_environment)
+        elif request_id is not None:
+            reply(request_id, {})
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

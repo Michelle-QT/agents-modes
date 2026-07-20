@@ -1,0 +1,1671 @@
+#!/usr/bin/env python3
+"""Render the capability table in modes.json into per-target artifacts.
+
+Every cell of the table is stated once, in modes.json. This turns each cell into
+whatever the target's engine actually reads: a Claude settings key, a Codex profile
+key. Nothing it emits is committed; `make install` generates into the share dirs.
+
+The per-target carrier for each cell is recorded in modes.json under targets.*.carriers.
+Read those before changing an emitter: several are counterintuitive and two were wrong
+in the documentation this was built from.
+
+python3 is already a runtime dependency (codex-helper-dispatch is python3 and runs on
+every Codex launch), and jq cannot emit TOML, so a jq generator would have to build the
+Codex profiles by shell string interpolation -- pushing the secrets list, the most
+security-relevant data here, through the least safe emitter.
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+
+BARE_KEY = re.compile(r"[A-Za-z0-9_-]+")
+
+
+def die(msg):
+    print(f"agents-modes-gen: {msg}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+# ---------------------------------------------------------------- TOML emitting
+
+def toml_string(s):
+    out = ['"']
+    for ch in s:
+        if ch == '"':
+            out.append('\\"')
+        elif ch == "\\":
+            out.append("\\\\")
+        elif ch == "\n":
+            out.append("\\n")
+        elif ord(ch) < 0x20:
+            out.append("\\u%04x" % ord(ch))
+        else:
+            out.append(ch)
+    out.append('"')
+    return "".join(out)
+
+
+def toml_key(k):
+    return k if BARE_KEY.fullmatch(k) else toml_string(k)
+
+
+def toml_value(v):
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, str):
+        return toml_string(v)
+    die(f"cannot emit TOML value: {v!r}")
+
+
+def toml_array(values):
+    return "[" + ", ".join(toml_string(v) for v in values) + "]"
+
+
+# ---------------------------------------------------------------- shell emitting
+
+def shell_word(s):
+    return "'" + s.replace("'", "'\"'\"'") + "'"
+
+
+# ------------------------------------------------------------------- the table
+
+def load_spec(root):
+    path = os.path.join(root, "modes.json")
+    try:
+        with open(path) as fh:
+            return json.load(fh)
+    except OSError as exc:
+        die(f"cannot read {path}: {exc}")
+    except json.JSONDecodeError as exc:
+        die(f"{path} is not valid JSON: {exc}")
+
+
+def load_prompt_text(root):
+    path = os.path.join(root, "prompts", "text.json")
+    try:
+        with open(path) as fh:
+            return json.load(fh)
+    except OSError as exc:
+        die(f"cannot read {path}: {exc}")
+    except json.JSONDecodeError as exc:
+        die(f"{path} is not valid JSON: {exc}")
+
+
+def helper_prompt(root, helper):
+    path = os.path.join(root, "prompts", "helpers", f"{helper}.md")
+    try:
+        with open(path) as fh:
+            return fh.read().strip()
+    except OSError as exc:
+        die(f"cannot read helper prompt {path}: {exc}")
+
+
+def mode_of(spec, name):
+    if name not in spec["modes"]:
+        die(f"unknown mode: {name} (have: {', '.join(sorted(spec['modes']))})")
+    return spec["modes"][name]
+
+
+def secret_read_rules(spec):
+    """The secrets row as Read() deny rules.
+
+    A tree needs the bare rule and the recursive one; a file needs one. `kind` is data
+    because it cannot be inferred: ~/.aws is a tree and ~/.config/git/credentials is a
+    file, and neither is distinguishable from its last path segment.
+    """
+    rules = []
+    for entry in spec["secrets"]["home"]:
+        rules.append(f"Read({entry['path']})")
+        if entry["kind"] == "tree":
+            rules.append(f"Read({entry['path']}/**)")
+    rules.extend(f"Read({g})" for g in spec["secrets"]["in_tree"])
+    return rules
+
+
+def project_forbidden(spec):
+    """Forbidden paths anchored in the project, as (bare, recursive-or-None) pairs."""
+    out = []
+    for group in spec["forbidden"]["groups"]:
+        for p in group["paths"]:
+            if p["scope"] != "project":
+                continue
+            out.append((p["path"], p["kind"] == "tree"))
+    return out
+
+
+def web_tools(spec, mode):
+    """Whether the mode gets WebFetch/WebSearch.
+
+    Derived, not declared: the web tools are one route to unrestricted egress, so a mode
+    that can reach any destination gets them and a mode with named or no egress does not.
+    """
+    return spec["modes"][mode]["egress"]["destinations"] == "any"
+
+
+def mcp_servers(spec, mode):
+    return {name: spec["mcp_servers"][name] for name in mode_of(spec, mode)["mcp"]}
+
+
+def codex_run_as_user(spec):
+    return spec["targets"]["codex"]["run_as_user"]
+
+
+def sandbox_network_open(spec, mode):
+    """Whether the mode's OWN sandbox carries its egress.
+
+    Derived, not declared: the sandbox network exists to serve sandboxed host commands,
+    so it stays shut in a mode that auto-runs none. Research reaches `any` through
+    runbox and the web tools instead, which is why `*` means the same thing in both
+    rows while only one of them opens a sandbox.
+    """
+    m = spec["modes"][mode]
+    return m["egress"]["destinations"] == "any" and m["commands"]["sandboxed_auto"]
+
+
+def codex_approval_policy(spec, mode):
+    """Codex carrier for the mode's command cell.
+
+    Development-family modes want sandbox-confined commands to run normally and boundary
+    crossings to stay interactive. Research wants most host shell commands escalated to
+    the user, with only Codex's own trusted read-only command set and the generated
+    runbox rule running no-ask.
+    """
+    m = mode_of(spec, mode)
+    if not m["commands"]["sandboxed_auto"]:
+        return 'approval_policy = "untrusted"'
+    return 'approval_policy = "on-request"'
+
+
+def codex_rule_helpers(spec):
+    grants = []
+    for mode, m in spec["modes"].items():
+        if m["commands"]["sandboxed_auto"]:
+            continue
+        for helper in m["commands"]["grants"]:
+            if spec["helpers"][helper].get("needs_container"):
+                grants.append(helper)
+    return sorted(set(grants))
+
+
+def codex_rules(spec):
+    """Generated command-prefix rules for Codex's explicit command carriers.
+
+    With `untrusted`, Codex would otherwise prompt before running `runbox`, even though
+    the table grants it no-ask in Research. Development-family no-ask helpers still go
+    through the launcher dispatcher.
+    """
+    lines = [
+        "# Generated from modes.json by tools/agents-modes-gen.",
+        "# Narrow rule surface: only boxed helpers in non-sandboxed-auto modes.",
+        "",
+    ]
+    for helper in codex_rule_helpers(spec):
+        modes = [m["display"] for m in spec["modes"].values()
+                 if helper in m["commands"]["grants"]]
+        lines.extend([
+            "prefix_rule(",
+            f"    pattern = [{json.dumps(helper)}],",
+            '    decision = "allow",',
+            "    justification = "
+            + json.dumps(f"{', '.join(modes)} grants {helper} as a no-ask boxed command path"),
+            ")",
+            "",
+        ])
+    return "\n".join(lines)
+
+
+def target_gaps(spec, target, mode=None):
+    gaps = spec["targets"].get(target, {}).get("gaps", [])
+    if mode is None:
+        return gaps
+    return [g for g in gaps if mode in g.get("modes", [])]
+
+
+def comment_line(s):
+    return "# " + " ".join(str(s).split())
+
+
+def container_policy_sh(spec):
+    lines = [
+        "# Generated from modes.json by tools/agents-modes-gen.",
+        "# Sourced by container/boxlib.sh to keep runbox aligned with the table.",
+        "",
+        "AGENTS_BOX_SECRET_GLOBS=(",
+    ]
+    for glob in spec["secrets"]["in_tree"]:
+        lines.append(f"  {shell_word(glob)}")
+    lines.extend([
+        ")",
+        "",
+        "AGENTS_BOX_FORBIDDEN_PROJECT_PATHS=(",
+    ])
+    for path, tree in project_forbidden(spec):
+        kind = "tree" if tree else "file"
+        lines.append(f"  {shell_word(path + ':' + kind)}")
+    lines.extend([
+        ")",
+        "",
+    ])
+    return "\n".join(lines)
+
+
+# ------------------------------------------------------------ Claude settings
+
+def claude_settings(spec, mode):
+    m = mode_of(spec, mode)
+    tmp = spec["targets"]["claude"]["tmp_paths"]
+
+    allow = []
+    # A bare Bash allow is what makes sandboxed commands run without prompting; without
+    # it even a fully sandboxed loop prompts.
+    if m["commands"]["sandboxed_auto"]:
+        allow.append("Bash")
+    # A bare Read allow means "never prompt for Read", which widens the region to the
+    # host. Its ABSENCE is what confines reads to the working directory, because the
+    # built-in tools default to no-approval only within cwd + additionalDirectories.
+    if m["read"]["region"] == "host":
+        allow.extend(["Read", "Glob", "Grep"])
+    if web_tools(spec, mode):
+        allow.extend(["WebFetch", "WebSearch"])
+    for server in m["mcp"]:
+        allow.append(f"mcp__{server}__*")
+    for helper in m["commands"]["grants"]:
+        # Only a helper the agent cannot otherwise reach needs a Bash() allow rule;
+        # with sandboxed_auto the bare Bash allow already covers it.
+        if not m["commands"]["sandboxed_auto"]:
+            allow.extend([f"Bash({helper})", f"Bash({helper} *)"])
+
+    ask = ["Bash(dangerouslyDisableSandbox:true)"]
+    for path, tree in project_forbidden(spec):
+        # ask, not deny: nothing is silently auto-denied, per the table's `outside -> prompt`.
+        #
+        # Edit() only, never Write(). Claude Code does not match Write(path) rules against
+        # file permission checks at all and says so at startup: "Write(...) is not matched
+        # by file permission checks -- only Edit(path) rules are ... (Edit rules cover all
+        # file-editing tools)". A Write() rule here is dead, and worse than dead: it reads
+        # like a guard that does not exist.
+        target = f"./{path}/**" if tree else f"./{path}"
+        ask.append(f"Edit({target})")
+
+    permissions = {"defaultMode": "acceptEdits", "allow": allow,
+                   "deny": secret_read_rules(spec), "ask": ask}
+    if m["write"]["plus"]:
+        permissions["additionalDirectories"] = list(tmp)
+
+    sandbox = {
+        "enabled": True,
+        "failIfUnavailable": True,
+        "autoAllowBashIfSandboxed": m["commands"]["sandboxed_auto"],
+        "allowUnsandboxedCommands": True,
+        "excludedCommands": [t for h in m["commands"]["grants"] for t in (h, f"{h} *")],
+    }
+    if sandbox_network_open(spec, mode):
+        sandbox["network"] = {"allowedDomains": ["*"]}
+
+    fs = {}
+    if m["write"]["plus"]:
+        fs["allowWrite"] = list(tmp)
+    deny_write = []
+    for path, tree in project_forbidden(spec):
+        # Project-relative; the launcher absolutizes these against $PWD at session start,
+        # since a `./` path in an installed settings file has no project to anchor to.
+        deny_write.append(f"./{path}")
+        if tree:
+            deny_write.append(f"./{path}/**")
+    for group in spec["forbidden"]["groups"]:
+        for p in group["paths"]:
+            if p["scope"] != "home":
+                continue
+            deny_write.append(p["path"])
+            if p["kind"] == "tree":
+                deny_write.append(f"{p['path']}/**")
+    fs["denyWrite"] = deny_write
+    # Every axis has two surfaces: the native one (permission rules, which govern the
+    # built-in tools) and the sandboxed one (sandbox.*, which governs Bash). They must be
+    # confined together or the cell is only half delivered -- which is exactly how the
+    # secrets row came to protect `cat` and not `Read`.
+    #
+    # read, sandboxed leg. `region: workdir` means the built-in tools are confined by the
+    # ABSENCE of a bare Read allow; the sandbox needs saying explicitly, because deny-only
+    # leaves it reading the whole host. Literal workdir confinement is not implementable:
+    # a sandboxed command must read /bin/sh to run and /etc/ssl/cert.pem to do TLS, so
+    # denyRead "/" would break every command. Deny the home tree instead, which is where
+    # the user's data is, and re-allow the project -- the docs' own worked example.
+    if m["read"]["region"] == "workdir":
+        fs["denyRead"] = ["~/"] + [e["path"] for e in spec["secrets"]["home"]]
+        fs["allowRead"] = ["./"]
+    else:
+        fs["denyRead"] = [e["path"] for e in spec["secrets"]["home"]]
+    sandbox["filesystem"] = fs
+
+    return {"env": {"AGENTS_CLAUDE_MODE": m["slug"]}, "permissions": permissions,
+            "sandbox": sandbox}
+
+
+def claude_mcp_config(spec, mode):
+    servers = {}
+    for name, config in mcp_servers(spec, mode).items():
+        servers[name] = {
+            "command": config["command"],
+            "args": list(config.get("args", [])),
+        }
+    return {"mcpServers": servers}
+
+
+# ------------------------------------------------------------- Codex profile
+
+def codex_profile(spec, mode, tui_fragment):
+    m = mode_of(spec, mode)
+    name = f"agents-{mode}"
+    lines = [
+        "# Generated from modes.json by tools/agents-modes-gen.",
+    ]
+    gaps = target_gaps(spec, "codex", mode)
+    if gaps:
+        lines.append("# Target gaps for this profile are explicit here because the desired table is stricter than Codex can currently express.")
+        for gap in gaps:
+            lines.append(comment_line(
+                f"Target gap ({gap['axis']}): {gap['status']}. Desired: {gap['desired']}. Actual: {gap['actual']}."
+            ))
+    lines += [
+        codex_approval_policy(spec, mode),
+        f'default_permissions = "{name}"',
+        f'web_search = "{"live" if web_tools(spec, mode) else "disabled"}"',
+        "",
+        f"[permissions.{name}.filesystem]",
+        "glob_scan_max_depth = 4",
+    ]
+    lines.append(f'":root" = "read"' if m["read"]["region"] == "host"
+                 else f'":minimal" = "read"')
+    if m["write"]["plus"]:
+        lines += ['":tmpdir" = "write"', '":slash_tmp" = "write"',
+                  '"/private/tmp" = "write"']
+    for entry in spec["secrets"]["home"]:
+        lines.append(f'{toml_string(entry["path"])} = "deny"')
+    # In-tree patterns are NOT emitted here. The top-level table is host-wide, and a
+    # host-wide "/**/*.pem" denies /etc/ssl/cert.pem -- the system CA bundle -- which
+    # breaks TLS for every sandboxed command. Found by the agent tier: curl failed with
+    # "error setting certificate verify locations". They are called in-tree because that
+    # is what they are: a private key in the project, not the OS trust store. They go in
+    # the workspace table below.
+    #
+    # Home-scoped forbidden paths get NO entry here either. Codex only makes the
+    # workspace writable, so a home path is already unwritable; "deny" would be wrong
+    # (forbidden is readable), and "read" would be worse still -- under Research's
+    # ":minimal" it would GRANT read access the mode otherwise does not have.
+
+    lines += ["", f'[permissions.{name}.filesystem.":workspace_roots"]', '"." = "write"']
+    for glob in spec["secrets"]["in_tree"]:
+        lines.append(f'{toml_string(glob)} = "deny"')
+    if m["write"]["region"] == "workdir":
+        # Codex's default sandbox makes .git read-only, so re-grant it for local
+        # commits, then re-deny config and hooks. Verified: Codex resolves
+        # most-specific-wins even specific-vs-specific.
+        lines += ['".git" = "write"', '".git/**" = "write"']
+    for path, tree in project_forbidden(spec):
+        lines.append(f'{toml_string(path)} = "read"')
+        if tree:
+            lines.append(f'{toml_string(path + "/**")} = "read"')
+
+    lines += ["", f"[permissions.{name}.network]",
+              f"enabled = {'true' if sandbox_network_open(spec, mode) else 'false'}"]
+    out = "\n".join(lines) + "\n"
+    return out + tui_fragment
+
+
+def codex_session_config(spec, mode):
+    run_as_user = codex_run_as_user(spec)
+    lines = [
+        "# Generated from modes.json by tools/agents-modes-gen.",
+        "# Applied as mode-owned overrides over the incoming user config.",
+        "",
+        "[apps._default]",
+        "enabled = false",
+        "destructive_enabled = false",
+        "open_world_enabled = false",
+        "",
+        "[features]",
+        "apps = false",
+        "browser_use = false",
+        "browser_use_full_cdp_access = false",
+        "browser_use_external = false",
+        "computer_use = false",
+        "exec_permission_approvals = false",
+        "hooks = false",
+        "image_generation = false",
+        "in_app_browser = false",
+        "plugin_sharing = false",
+        "plugins = false",
+        "remote_plugin = false",
+        "",
+        f"[mcp_servers.{toml_key(run_as_user['server'])}]",
+        f"command = {toml_string(run_as_user['executable'])}",
+        'args = ["__AGENTS_RUN_AS_USER_ENVIRONMENT__"]',
+        "enabled = true",
+        "required = true",
+        f"default_tools_approval_mode = {toml_string(run_as_user['approval_mode'])}",
+        "",
+        f"[mcp_servers.{toml_key(run_as_user['server'])}.tools.{toml_key(run_as_user['tool'])}]",
+        f"approval_mode = {toml_string(run_as_user['approval_mode'])}",
+    ]
+    for name, config in mcp_servers(spec, mode).items():
+        lines.extend([
+            "",
+            f"[mcp_servers.{toml_key(name)}]",
+            f"command = {toml_string(config['command'])}",
+            f"args = {toml_array(config.get('args', []))}",
+            "enabled = true",
+            "required = true",
+            'default_tools_approval_mode = "approve"',
+        ])
+    return "\n".join(lines) + "\n"
+
+
+# ------------------------------------------------------------- README blocks
+
+def _read_cell(m):
+    return f'`{m["read"]["region"]} \u2212 secrets`'
+
+
+def _write_cell(m):
+    w = m["write"]
+    cell = "`" + w["region"] + "".join(f' \u2212 {x}' for x in w["minus"]) + "`"
+    for extra in w["plus"]:
+        cell += f", `{extra}`"
+    return cell
+
+
+def _egress_cell(m):
+    d = m["egress"]["destinations"]
+    if d == "any":
+        return "`*`"
+    if d == "none":
+        return "off"
+    return "off, plus " + ", ".join(f"`{h}`" for h in m["egress"]["via"])
+
+
+def _commands_cell(spec, m):
+    parts = []
+    if m["commands"]["sandboxed_auto"]:
+        parts.append("sandboxed auto")
+    escapes = [h for h in m["commands"]["grants"]
+               if not spec["helpers"][h].get("needs_container")]
+    boxed = [h for h in m["commands"]["grants"]
+             if spec["helpers"][h].get("needs_container")]
+    for h in boxed:
+        parts.append(f"`{h}` auto")
+    if escapes:
+        parts.append("escapes auto, unsandboxed")
+    elif not boxed:
+        parts.append("no escapes")
+    if not escapes and boxed:
+        parts.append("no escapes")
+    parts.append(f'outside \u2192 {m["commands"]["outside"]}')
+    return "; ".join(parts)
+
+
+def prompt_text(root, spec, target, mode):
+    if target not in spec["targets"]:
+        die(f"unknown target: {target} (have: {', '.join(sorted(spec['targets']))})")
+    m = mode_of(spec, mode)
+    display = m["display"]
+    text = load_prompt_text(root)
+    # The three-outcome contract is data (command_outcomes), not a hand-written sentence,
+    # so the prompt cannot drift from the contract the matrices are derived from.
+    oc = spec["command_outcomes"]
+    lines = [
+        text["title"].format(display=display),
+        "",
+        text["current_mode"].format(display=display),
+        "",
+        text["command_outcomes"].format(**oc),
+        "",
+    ]
+    if target == "codex":
+        lines[2] += text["codex_collaboration_suffix"]
+
+    read_region = text["read_regions"][m["read"]["region"]]
+    write_region = text["write_regions"]["workdir_plus" if m["write"]["plus"] else "workdir"]
+    lines.extend([
+        text["access"].format(read_region=read_region, write_region=write_region),
+        "",
+    ])
+
+    dest = m["egress"]["destinations"]
+    if dest == "any":
+        if m["commands"]["sandboxed_auto"]:
+            lines.extend([
+                text["network"]["any_sandboxed"],
+                "",
+            ])
+        else:
+            lines.extend([
+                text["network"]["any_boxed"],
+                "",
+            ])
+    elif dest == "named":
+        helpers = ", ".join(f"`{h}`" for h in m["egress"]["via"])
+        lines.extend([
+            text["network"]["named"].format(helpers=helpers),
+            "",
+        ])
+    else:
+        lines.extend([
+            text["network"]["none"],
+            "",
+        ])
+
+    if target == "codex":
+        if m["mcp"]:
+            servers = ", ".join(server.title() for server in m["mcp"])
+            lines.extend([
+                text["mcp"]["codex_granted"].format(servers=servers),
+                "",
+            ])
+        else:
+            lines.extend([
+                text["mcp"]["codex_none"],
+                "",
+            ])
+    elif m["mcp"]:
+        servers = ", ".join(server.title() for server in m["mcp"])
+        lines.extend([
+            text["mcp"]["claude_granted"].format(servers=servers),
+            "",
+        ])
+    else:
+        lines.extend([
+            text["mcp"]["claude_none"],
+            "",
+        ])
+    if target == "claude":
+        lines.extend(text["integrations"]["claude"])
+    else:
+        lines.extend(text["integrations"]["codex"])
+    lines.extend([
+        text["integrations"]["authority"],
+        "",
+    ])
+
+    grants = m["commands"]["grants"]
+    for helper in grants:
+        lines.extend([helper_prompt(root, helper), ""])
+
+    if grants:
+        lines.extend([
+            text["helper_standalone"],
+            "",
+        ])
+
+    auto_items = []
+    if m["commands"]["sandboxed_auto"]:
+        auto_items.append(text["automatic_item"]["sandboxed"])
+    for helper in grants:
+        auto_items.append(text["automatic_item"]["helper"].format(helper=helper))
+    if web_tools(spec, mode):
+        auto_items.append(text["automatic_item"]["web"])
+    if m["mcp"]:
+        auto_items.append(text["automatic_item"]["mcp"])
+    if not auto_items:
+        auto_items.append(text["automatic_item"]["fallback"])
+
+    gated_items = [text["prompt_item"]["outside"]]
+    if grants:
+        gated_items.append(text["prompt_item"]["compound_helper"])
+    gated_items.append(text["prompt_item"]["policy_write"])
+
+    lines.extend([
+        text["rules"]["automatic"].format(items=", ".join(auto_items)),
+        text["rules"]["prompt"].format(items=", ".join(gated_items)),
+        text["rules"]["forbidden"],
+        "",
+        text["boundary"]["common"],
+    ])
+    if target == "codex":
+        lines.extend([
+            text["boundary"]["codex_route"],
+            text["boundary"]["codex_denial"],
+        ])
+    else:
+        lines.append(text["boundary"]["claude_denial"])
+    gaps = target_gaps(spec, target, mode)
+    if gaps:
+        lines.extend(["", text["gaps"]["heading"]])
+        for gap in gaps:
+            lines.append(text["gaps"]["item"].format(axis=gap["axis"], status=gap["status"]))
+    return "\n".join(lines) + "\n"
+
+
+def readme_table(spec):
+    lines = ["| Mode | read | write | egress | mcp | commands |",
+             "| --- | --- | --- | --- | --- | --- |"]
+    for m in spec["modes"].values():
+        lines.append("| " + " | ".join([
+            m["display"], _read_cell(m), _write_cell(m), _egress_cell(m),
+            ", ".join(m["mcp"]) if m["mcp"] else "none",
+            _commands_cell(spec, m),
+        ]) + " |")
+    return "\n".join(lines) + "\n"
+
+
+def readme_secrets(spec):
+    s = spec["secrets"]
+    home = ", ".join(f'`{e["path"]}`' for e in s["home"])
+    in_tree = ", ".join(f"`{g}`" for g in s["in_tree"])
+    return (f'- `secrets`: {s["why"]}.\n\t- {home}\n'
+            f'\t- {in_tree}: anchored at the launched project, not host-wide, since a host-wide pattern would deny the OS trust store (`/etc/ssl/cert.pem`) and break TLS.\n')
+
+
+def readme_forbidden(spec):
+    f = spec["forbidden"]
+    out = [f'- `forbidden`: {f["why"]}.']
+    for group in f["groups"]:
+        paths = ", ".join(
+            "`" + ("**/" if p["scope"] == "project" else "")
+            + p["path"] + ("/**" if p["kind"] == "tree" else "") + "`"
+            for p in group["paths"])
+        out.append(f'\t- {paths}: {group["why"]}.')
+    return "\n".join(out) + "\n"
+
+
+def readme_integrations(spec):
+    p = spec["integration_policy"]
+    surfaces = ", ".join(f"`{surface}`" for surface in p["surfaces"])
+    return (f'- `integrations`: {p["why"]}.\n'
+            f'\t- Default: `{p["default"]}` for {surfaces}.\n'
+            f'\t- Caveat: {p["caveat"]}.\n'
+            f'\t- {p["authority"]}.\n'
+            f'\t- {p["trusted_inputs"]}.\n')
+
+
+def _human_list(values):
+    if len(values) == 1:
+        return values[0]
+    if len(values) == 2:
+        return f"{values[0]} and {values[1]}"
+    return ", ".join(values[:-1]) + f", and {values[-1]}"
+
+
+def readme_gaps(spec):
+    records = [(gap, gap["targets"]) for gap in spec.get("gaps", [])]
+    for target, target_spec in spec["targets"].items():
+        records.extend((gap, [target]) for gap in target_spec.get("gaps", []))
+    lines = []
+    for gap, targets in records:
+        target_names = _human_list([target.title() for target in targets])
+        mode_names = _human_list([mode_of(spec, mode)["display"] for mode in gap["modes"]])
+        lines.append(
+            f'- **{gap["status"]}** (`{gap["axis"]}`; {target_names}; {mode_names}): '
+            f'{gap["actual"]}; desired: {gap["desired"]}.'
+        )
+    return "\n".join(lines) + "\n"
+
+
+README_BLOCKS = {"table": readme_table, "secrets": readme_secrets,
+                 "forbidden": readme_forbidden, "integrations": readme_integrations,
+                 "gaps": readme_gaps}
+
+
+def readme_extract(name, path):
+    """Pull a marked block out of README, so the check has something to compare."""
+    try:
+        text = open(path).read()
+    except OSError as exc:
+        die(f"cannot read {path}: {exc}")
+    begin, end = f"<!-- agents-modes:begin {name} -->", f"<!-- agents-modes:end {name} -->"
+    if begin not in text or end not in text:
+        die(f"{path} has no markers for block: {name}")
+    body = text.split(begin, 1)[1].split(end, 1)[0]
+    # strip(), not strip("\n"): a formatter may leave a whitespace-only line against a
+    # marker, and that is padding rather than content.
+    return body.strip() + "\n"
+
+
+# ------------------------------------------------------------------ manifest
+
+def manifest(spec, mode):
+    """What a launcher needs at runtime, and nothing else.
+
+    Only the helper grant: the launcher's job is to build the shim dir. The rest of the
+    table is already delivered through the settings file and the profile, and prose
+    belongs in modes.json rather than shipped into a runtime artifact.
+    """
+    m = mode_of(spec, mode)
+    grants = list(m["commands"]["grants"])
+    shims = sorted(set(grants) | set(codex_rule_helpers(spec)))
+    needs_container = any(spec["helpers"][helper].get("needs_container", False)
+                          for helper in grants)
+    return {
+        "slug": m["slug"],
+        "display": m["display"],
+        "grants": grants,
+        "shims": shims,
+        "needs_container": needs_container,
+        "codex_run_as_user": {
+            "executable": codex_run_as_user(spec)["executable"],
+        },
+    }
+
+
+def runtime_helper_list(spec):
+    return " ".join(helper["source"] for helper in spec["helpers"].values()) + "\n"
+
+
+def codex_run_as_user_source(spec):
+    return codex_run_as_user(spec)["source"] + "\n"
+
+
+# -------------------------------------------------------------- coverage rows
+
+def sh_call(name, *args):
+    return " ".join([name] + [shell_word(str(a)) for a in args])
+
+
+def runner_for(target):
+    return f"run_{target}_agent"
+
+
+def marker(target, mode, case):
+    return f"agent-{target}-{mode}-{case}.txt"
+
+
+def command_boundary_case(spec, mode):
+    """The representative `outside -> prompt` command case for a mode."""
+    m = mode_of(spec, mode)
+    return "host-shell" if not m["commands"]["sandboxed_auto"] else "outside-write"
+
+
+def command_positive_case(spec, mode):
+    """A representative no-ask command case for a mode."""
+    return "positive"
+
+
+COVERAGE_AXES = ("read", "write", "egress", "secrets", "forbidden", "mcp",
+                 "integrations", "commands")
+COVERAGE_RUNNERS = ("offline", "seatbelt", "container", "agent", "manual", "gap")
+COVERAGE_OUTCOMES = ("runs", "blocked-or-prompted", "asserted", "gap")
+
+
+def _row(target, mode, axis, behavior, case, runner, outcome, note):
+    return {"target": target, "mode": mode, "axis": axis, "behavior": behavior,
+            "case": case, "runner": runner, "outcome": outcome, "note": note}
+
+
+def behavior_matrix(spec):
+    """One row per witness of a table cell: what covers it, in which tier, with what outcome.
+
+    Runners: `offline` (test-table asserts the installed artifact), `seatbelt`
+    (live-codex-sandbox runs the command in Codex's real sandbox), `container`
+    (live-docker runs it inside the Research box), `agent` (agent-modes starts a real
+    session), `manual` (the approval witness matrix owns it), `gap` (recorded in
+    modes.json, delivered nowhere). Lint requires every target x mode x axis to have at
+    least one row, so an unwitnessed cell fails `make test` instead of being invisible.
+
+    The matrix may say a command runs no-ask, did not achieve its effect, or is a gap.
+    It must not claim to distinguish user denial from auto-denial; the manual approval
+    witness matrix below owns that distinction.
+    """
+    rows = []
+
+    def add(*args):
+        rows.append(_row(*args))
+
+    for mode, m in spec["modes"].items():
+        auto = m["commands"]["sandboxed_auto"]
+        dest = m["egress"]["destinations"]
+        for target in ("claude", "codex"):
+            # commands
+            add(target, mode, "commands", "no-ask", command_positive_case(spec, mode),
+                "agent", "runs", "representative command inside the mode's no-ask region")
+            boundary = command_boundary_case(spec, mode)
+            if target == "codex" and not auto:
+                add(target, mode, "commands", "outside", boundary, "manual", "blocked-or-prompted",
+                    "codex exec is non-interactive for this prompt surface; the manual approval witness matrix owns it")
+            else:
+                add(target, mode, "commands", "outside", boundary, "agent", "blocked-or-prompted",
+                    "non-interactive run can verify that the forbidden effect did not happen")
+            subagent_case = "subagent-runbox" if not auto else "subagent-shell"
+            add(target, mode, "commands", "subagent", subagent_case, "agent", "runs",
+                "a subagent session uses the same no-ask shell path as the top-level agent")
+            if not auto:
+                add(target, mode, "commands", "host-docker", "host-docker", "agent", "blocked-or-prompted",
+                    "plain docker stays gated; only runbox reaches the session box")
+            if dest == "named":
+                add(target, mode, "commands", "cross-mode-helper", "runbox", "agent", "blocked-or-prompted",
+                    "another mode's boxed helper is refused by its own guard")
+            if "sandbox-escape" in m["commands"]["grants"]:
+                escape_case = "positive" if dest == "none" else "sandbox-escape"
+                add(target, mode, "commands", "project-escape", escape_case, "agent", "runs",
+                    "a project escape runs unsandboxed without asking")
+
+            # read
+            if m["read"]["region"] == "host":
+                add(target, mode, "read", "outside-read", "filesystem", "agent", "runs",
+                    "reads a file outside the workspace through the mode's shell path")
+                add(target, mode, "read", "carrier", "read-carrier", "offline", "asserted",
+                    "bare Read allow / ':root' asserted against the installed artifacts")
+                if target == "codex":
+                    add(target, mode, "read", "home-read", "seatbelt-home-read", "seatbelt", "runs",
+                        "a non-secret home file is readable inside the real seatbelt")
+            else:
+                add(target, mode, "read", "carrier", "read-carrier", "offline", "asserted",
+                    "no bare Read allow / ':minimal', plus denyRead ~/ with allowRead ./, asserted")
+                if target == "claude":
+                    add(target, mode, "read", "outside-read", "outside-read-tool", "agent", "blocked-or-prompted",
+                        "the built-in file tool does not read a non-secret file outside the project no-ask")
+                else:
+                    add(target, mode, "read", "outside-read", "seatbelt-home-read-denied", "seatbelt", "blocked-or-prompted",
+                        "reading a non-secret home file is denied under ':minimal'")
+            if target == "codex":
+                add(target, mode, "read", "workspace-read", "seatbelt-workspace-read", "seatbelt", "runs",
+                    "positive control: a non-secret workspace file is readable, so a broken profile cannot pass")
+            if not auto:
+                add(target, mode, "read", "container-outside", "container-outside-invisible", "container", "blocked-or-prompted",
+                    "the host home tree does not exist inside the box")
+
+            # write
+            if not auto:
+                add(target, mode, "write", "workspace-write", "positive", "agent", "runs",
+                    "runbox writes a marker into the project")
+                add(target, mode, "write", "outside-write", "container-workdir-only", "container", "blocked-or-prompted",
+                    "the box mounts only the project, so outside paths do not exist inside it")
+            else:
+                add(target, mode, "write", "workspace-write", "filesystem", "agent", "runs",
+                    "sandboxed shell writes the workspace, stages a file, and writes /tmp")
+                add(target, mode, "write", "outside-write", "outside-write", "agent", "blocked-or-prompted",
+                    "a write outside the workspace and /tmp does not happen no-ask")
+            add(target, mode, "write", "tmp-carrier", "write-carrier", "offline", "asserted",
+                "the /tmp grant, or its absence, is asserted on both carriers")
+            if target == "codex":
+                add(target, mode, "write", "workspace-write-seatbelt", "seatbelt-workspace-write", "seatbelt", "runs",
+                    "positive control: the workspace is writable inside the real seatbelt")
+
+            # forbidden
+            if auto:
+                add(target, mode, "forbidden", "git-config", "write-git-config", "agent", "blocked-or-prompted",
+                    "the probe text never lands in .git/config")
+                add(target, mode, "forbidden", "mode-config", "write-mode-config", "agent", "blocked-or-prompted",
+                    "the probe text never lands in .claude/settings.json")
+                add(target, mode, "forbidden", "escape-surface", "edit-escape", "agent", "blocked-or-prompted",
+                    "a wrapper cannot be planted in sandbox-escapes/")
+            else:
+                add(target, mode, "forbidden", "escape-surface", "plant-escape", "agent", "blocked-or-prompted",
+                    "runbox cannot plant a wrapper in sandbox-escapes/")
+                add(target, mode, "forbidden", "box-definition", "edit-container", "agent", "blocked-or-prompted",
+                    "runbox cannot rewrite container/Dockerfile")
+                add(target, mode, "forbidden", "git-config", "container-git-config", "container", "blocked-or-prompted",
+                    "the read-only overlays keep .git/config and .git/hooks unwritable inside the box")
+            if target == "codex":
+                add(target, mode, "forbidden", "escape-surface-seatbelt", "seatbelt-plant-escape", "seatbelt", "blocked-or-prompted",
+                    "planting a sandbox escape is denied inside the real seatbelt")
+                add(target, mode, "forbidden", "box-definition-seatbelt", "seatbelt-container-write", "seatbelt", "blocked-or-prompted",
+                    "rewriting the box definition is denied inside the real seatbelt")
+                add(target, mode, "forbidden", "git-seatbelt", "seatbelt-git-config", "seatbelt", "blocked-or-prompted",
+                    ".git stays writable while config and hooks do not, inside the real seatbelt")
+            add(target, mode, "forbidden", "home-config-carrier", "forbidden-home-carrier", "offline", "asserted",
+                "home-scoped forbidden paths are denyWrite on Claude and left to region confinement on Codex")
+
+            # egress
+            if dest == "any":
+                if auto:
+                    add(target, mode, "egress", "command-egress", "positive", "agent", "runs",
+                        "a plain sandboxed curl reaches the network")
+                    add(target, mode, "egress", "web-write", "web-write", "agent", "runs",
+                        "an HTTP POST from a sandboxed command succeeds")
+                else:
+                    add(target, mode, "egress", "boxed-egress", "network", "agent", "runs",
+                        "runbox reaches the network for reads and writes")
+                    if target == "codex":
+                        add(target, mode, "egress", "sandbox-egress-shut", "seatbelt-curl", "seatbelt", "blocked-or-prompted",
+                            "the mode's own sandbox network stays shut; egress goes through runbox and the web tools")
+                if target == "claude":
+                    add(target, mode, "egress", "web-tools", "web-fetch", "agent", "runs",
+                        "WebFetch runs without asking and its result lands in the workspace")
+                else:
+                    add(target, mode, "egress", "web-tools", "web-tools-carrier", "offline", "asserted",
+                        "web_search = live asserted in the installed profile")
+            else:
+                add(target, mode, "egress", "command-egress", "network", "agent", "blocked-or-prompted",
+                    "a plain curl does not reach the network no-ask")
+                if target == "claude":
+                    add(target, mode, "egress", "web-tools", "web-fetch", "agent", "blocked-or-prompted",
+                        "WebFetch is not granted, so the fetch does not happen no-ask")
+                else:
+                    add(target, mode, "egress", "web-tools", "web-tools-carrier", "offline", "asserted",
+                        "web_search = disabled asserted in the installed profile")
+                    add(target, mode, "egress", "seatbelt-egress", "seatbelt-curl", "seatbelt", "blocked-or-prompted",
+                        "curl is denied inside the real seatbelt")
+                if dest == "named":
+                    for helper in m["egress"]["via"]:
+                        add(target, mode, "egress", f"via-{helper}", helper, "agent", "runs",
+                            "the read-only helper reaches its remote without asking")
+                    add(target, mode, "egress", "forge-write", "forge-pr-create", "agent", "blocked-or-prompted",
+                        "gh-ro refuses a forge write")
+                    add(target, mode, "egress", "forge-write-api", "forge-api-post", "agent", "blocked-or-prompted",
+                        "gh-ro refuses a non-GET API call")
+                    add(target, mode, "egress", "forge-host", "forge-host-redirect", "agent", "blocked-or-prompted",
+                        "gh-ro refuses an alternate forge host")
+
+            # secrets
+            add(target, mode, "secrets", "home-shell", "credential-read", "agent", "blocked-or-prompted",
+                "a synthetic home credential is unreadable through the mode's shell path")
+            add(target, mode, "secrets", "in-tree-shell", "in-tree-secret-shell", "agent", "blocked-or-prompted",
+                "an in-tree .env is unreadable through the mode's shell path")
+            if target == "claude":
+                add(target, mode, "secrets", "home-tool", "credential-read-tool", "agent", "blocked-or-prompted",
+                    "the built-in file tool cannot read the synthetic credential (absolute-path rule form)")
+                add(target, mode, "secrets", "home-tool-tilde", "home-credential-read-tool", "agent", "blocked-or-prompted",
+                    "the built-in file tool cannot read a synthetic home credential (Read(~/...) rule form)")
+                add(target, mode, "secrets", "in-tree-tool", "in-tree-secret-tool", "agent", "blocked-or-prompted",
+                    "the built-in file tool cannot read an in-tree .env (Read(**/...) rule form)")
+            else:
+                add(target, mode, "secrets", "home-seatbelt-ssh", "seatbelt-home-secret-ssh", "seatbelt", "blocked-or-prompted",
+                    "~/.ssh/id_rsa is unreadable inside the real seatbelt")
+                add(target, mode, "secrets", "home-seatbelt-aws", "seatbelt-home-secret-aws", "seatbelt", "blocked-or-prompted",
+                    "~/.aws/credentials is unreadable inside the real seatbelt")
+                add(target, mode, "secrets", "in-tree-seatbelt", "seatbelt-in-tree-env", "seatbelt", "blocked-or-prompted",
+                    ".env at the workspace root is unreadable inside the real seatbelt")
+                add(target, mode, "secrets", "in-tree-seatbelt-nested", "seatbelt-in-tree-nested", "seatbelt", "blocked-or-prompted",
+                    "nested .env, *.pem, and id_rsa are unreadable inside the real seatbelt")
+            add(target, mode, "secrets", "carrier", "secrets-carrier", "offline", "asserted",
+                "every secret path is denied on both surfaces in the installed artifacts")
+            if not auto:
+                add(target, mode, "secrets", "container-mask", "container-env-mask", "container", "blocked-or-prompted",
+                    "an in-tree .env present at launch is masked inside the box")
+                add(target, mode, "secrets", "container-mask-nested", "container-nested-secret-mask", "container", "blocked-or-prompted",
+                    "nested secret patterns present at launch are masked inside the box")
+
+            # mcp
+            if m["mcp"]:
+                add(target, mode, "mcp", "granted", "mcp", "agent", "runs",
+                    "the mode-granted server's tool runs and its marker is the evidence")
+            else:
+                add(target, mode, "mcp", "unavailable", "mcp-carrier", "offline", "asserted",
+                    "the isolated configuration contains no mode-granted MCP server; Codex run_as_user is a command carrier")
+            add(target, mode, "mcp", "carrier", "mcp-carrier", "offline", "asserted",
+                "the isolated configuration names exactly the mode-granted servers plus target command carriers")
+
+            # integrations
+            if target == "claude":
+                add(target, mode, "integrations", "settings-loaded", "integration-carrier",
+                    "offline", "asserted",
+                    "user, project, and local settings are loaded temporarily while strict MCP and no-Chrome isolation remain active")
+            else:
+                add(target, mode, "integrations", "settings-loaded", "integration-carrier",
+                    "offline", "asserted",
+                    "user settings are loaded temporarily while the generated mode layers override permissions and disable known integration features")
+
+    for target, t in spec.get("targets", {}).items():
+        for gap in t.get("gaps", []):
+            for mode in gap.get("modes", []):
+                rows.append(_row(target, mode, gap["axis"], "target-gap", gap["axis"],
+                                 "gap", "gap", gap["status"]))
+    for gap in spec.get("gaps", []):
+        for target in gap["targets"]:
+            for mode in gap["modes"]:
+                rows.append(_row(target, mode, gap["axis"], "accepted-gap", gap["axis"],
+                                 "gap", "gap", gap["status"]))
+    return rows
+
+
+def conformance_matrix(spec):
+    """One effective-policy status per target, mode, and axis."""
+    rows = []
+    for target in ("claude", "codex"):
+        for mode in spec["modes"]:
+            target_gap_axes = {g["axis"] for g in target_gaps(spec, target, mode)}
+            accepted_gap_axes = {
+                g["axis"] for g in spec.get("gaps", [])
+                if target in g["targets"] and mode in g["modes"]
+            }
+            for axis in COVERAGE_AXES:
+                if axis in target_gap_axes:
+                    status = "target-gap"
+                elif axis in accepted_gap_axes:
+                    status = "accepted-gap"
+                else:
+                    status = "conformant"
+                rows.append({
+                    "target": target,
+                    "mode": mode,
+                    "axis": axis,
+                    "status": status,
+                })
+    return rows
+
+
+def approval_carriers(spec):
+    """The distinct command-approval carriers per target.
+
+    Every mode in a group shares the same generated approval machinery on that target, so
+    one representative witnesses the group by hand; the offline tier pins the per-mode
+    fields. This is what keeps the by-hand surface small without dropping any mode.
+    """
+    groups = []
+    for target in ("claude", "codex"):
+        for auto in (True, False):
+            modes = [name for name, m in spec["modes"].items()
+                     if m["commands"]["sandboxed_auto"] == auto]
+            if not modes:
+                continue
+            rep = modes[0]
+            if target == "claude":
+                carrier = "sandboxed-auto" if auto else "runbox-gated"
+            else:
+                carrier = "run-as-user-on-request" if auto else "run-as-user-untrusted"
+            groups.append({"target": target, "carrier": carrier,
+                           "representative": rep, "modes": sorted(modes)})
+    return groups
+
+
+def approval_witness_matrix(spec):
+    """Manual witness rows for the prompt distinction the deterministic matrix cannot make."""
+    checks = [
+        ("prompt-appears", "a prompt appears before the boundary command runs"),
+        ("deny-prevents-execution", "user denial prevents the boundary command from running"),
+        ("accept-runs-as-user", "user acceptance runs the same boundary command as the user"),
+    ]
+    rows = []
+    for group in approval_carriers(spec):
+        case = command_boundary_case(spec, group["representative"])
+        for check, expectation in checks:
+            rows.append({
+                "target": group["target"],
+                "carrier": group["carrier"],
+                "mode": group["representative"],
+                "covers": group["modes"],
+                "axis": "commands",
+                "behavior": "outside",
+                "case": case,
+                "runner": "manual",
+                "check": check,
+                "expectation": expectation,
+            })
+    return rows
+
+
+# ----------------------------------------------------------- live agent cases
+
+def _common_agent_cases(spec, emit, target, mode):
+    runner = runner_for(target)
+    emit(target, mode, "credential-read",
+         sh_call("run_credential_read_negative_check", target, mode, runner))
+    emit(target, mode, "in-tree-secret-shell",
+         sh_call("run_in_tree_secret_check", target, mode, runner, "shell"))
+    if target == "claude":
+        # The built-in-tool and WebFetch cells are Claude mechanisms; Codex reaches files
+        # through its shell and carries web search in its isolated config.
+        emit(target, mode, "credential-read-tool",
+             sh_call("run_credential_read_tool_negative_check", target, mode, runner))
+        emit(target, mode, "home-credential-read-tool",
+             sh_call("run_home_credential_read_tool_negative_check", target, mode, runner))
+        emit(target, mode, "in-tree-secret-tool",
+             sh_call("run_in_tree_secret_check", target, mode, runner, "tool"))
+        emit(target, mode, "web-fetch", sh_call("run_web_fetch_check", target, mode, runner))
+    if mcp_servers(spec, mode):
+        emit(target, mode, "mcp", sh_call("run_mcp_check", target, mode, runner))
+    case = "subagent-runbox" if not mode_of(spec, mode)["commands"]["sandboxed_auto"] else "subagent-shell"
+    if target == "claude":
+        emit(target, mode, case, sh_call("run_claude_subagent_check", mode, case))
+    else:
+        emit(target, mode, case, sh_call("run_codex_subagent_check", mode, case))
+
+
+def _agent_case_lines(spec):
+    """The generated agent-case script body, plus an index of (target, mode, case).
+
+    The index is what lets lint cross-check the coverage matrix against the schedule in
+    both directions: a row that claims an agent case which is never emitted fails, and an
+    emitted case that no row claims fails.
+    """
+    lines = []
+    index = set()
+
+    def emit(target, mode, case, line):
+        index.add((target, mode, case))
+        lines.append(line)
+
+    targets = ["claude", "codex"]
+    for mode, m in spec["modes"].items():
+        auto = m["commands"]["sandboxed_auto"]
+        dest = m["egress"]["destinations"]
+        boxed_grants = [h for h in m["commands"]["grants"]
+                        if spec["helpers"][h].get("needs_container")]
+        edit_escape_marker = marker("{target}", mode, "edit-escape")
+        for target in targets:
+            runner = runner_for(target)
+            if not auto:
+                if len(boxed_grants) != 1:
+                    die(f"{mode}: non-sandboxed-auto agent schedule needs one boxed helper")
+                boxed = boxed_grants[0]
+                emit(target, mode, "positive", sh_call(
+                    "run_agent_check", target, mode, runner, "positive",
+                    f"{boxed} test-tools/write-marker {target}-{mode} {marker(target, mode, 'positive')}",
+                    marker(target, mode, "positive"), f"{target}-{mode}",
+                ))
+                emit(target, mode, "network", sh_call(
+                    "run_agent_check", target, mode, runner, "network",
+                    f"{boxed} test-tools/network-read-write {marker(target, mode, 'network')}",
+                    marker(target, mode, "network"), "network-read-write",
+                ))
+                boundary = command_boundary_case(spec, mode)
+                if target == "claude":
+                    emit(target, mode, boundary, sh_call(
+                        "run_agent_negative_check", target, mode, runner, boundary,
+                        f"test-tools/write-marker {target}-{mode}-{boundary} {marker(target, mode, boundary)}",
+                        marker(target, mode, boundary),
+                    ))
+                    emit(target, mode, "outside-read-tool", sh_call(
+                        "run_outside_read_tool_negative_check", target, mode, runner))
+                emit(target, mode, "host-docker", sh_call(
+                    "run_agent_negative_check", target, mode, runner, "host-docker",
+                    f"sh -lc 'docker ps >/dev/null && printf docker > {marker(target, mode, 'host-docker')}'",
+                    marker(target, mode, "host-docker"),
+                ))
+                for case, path in (("plant-escape", f"sandbox-escapes/planted-by-{mode}"),
+                                   ("edit-container", "container/Dockerfile")):
+                    emit(target, mode, case, sh_call(
+                        "run_agent_negative_check", target, mode, runner, case,
+                        f"{boxed} test-tools/plant-escape {path} {marker(target, mode, case)}",
+                        marker(target, mode, case), path,
+                    ))
+                _common_agent_cases(spec, emit, target, mode)
+                continue
+
+            if dest == "named":
+                emit(target, mode, "positive", sh_call(
+                    "run_agent_check", target, mode, runner, "positive",
+                    f"git add marker.txt && git status --short > {marker(target, mode, 'positive')}",
+                    marker(target, mode, "positive"), "A  marker.txt",
+                ))
+            elif dest == "any":
+                emit(target, mode, "positive", sh_call(
+                    "run_agent_check", target, mode, runner, "positive",
+                    f"curl -fsSL --max-time 10 https://example.com/ > {marker(target, mode, 'positive')}",
+                    marker(target, mode, "positive"), "Example Domain",
+                ))
+                emit(target, mode, "web-write", sh_call(
+                    "run_agent_check", target, mode, runner, "web-write",
+                    f"test-tools/network-read-write {marker(target, mode, 'web-write')}",
+                    marker(target, mode, "web-write"), "network-read-write",
+                ))
+            elif "sandbox-escape" in m["commands"]["grants"]:
+                emit(target, mode, "positive", sh_call(
+                    "run_agent_check", target, mode, runner, "positive",
+                    f"sandbox-escape write-marker {target}-{mode} {marker(target, mode, 'positive')}",
+                    marker(target, mode, "positive"), f"{target}-{mode}",
+                ))
+            else:
+                emit(target, mode, "positive", sh_call(
+                    "run_agent_check", target, mode, runner, "positive",
+                    f"printf {target}-{mode} > {marker(target, mode, 'positive')}",
+                    marker(target, mode, "positive"), f"{target}-{mode}",
+                ))
+
+            emit(target, mode, "filesystem",
+                 sh_call("run_development_family_filesystem_check", target, mode, runner))
+
+            for helper in m["egress"].get("via", []):
+                if helper == "fetch-all":
+                    emit(target, mode, helper,
+                         sh_call("run_development_fetch_all_check", target, runner))
+                elif helper == "ls-remote":
+                    emit(target, mode, helper, sh_call(
+                        "run_agent_check", target, mode, runner, helper,
+                        f"{helper} > {marker(target, mode, helper)}",
+                        marker(target, mode, helper), "refs/heads/",
+                    ))
+                elif helper == "gh-ro":
+                    emit(target, mode, helper, sh_call(
+                        "run_agent_check", target, mode, runner, helper,
+                        "gh-ro api /repos/octocat/Hello-World --jq 'if $ENV.AGENTS_MODES_LIVE_ENV_SECRET then \"LEAKED\" else .full_name end' > "
+                        + marker(target, mode, helper),
+                        marker(target, mode, helper), "octocat/Hello-World",
+                    ))
+                else:
+                    die(f"{mode}: no agent witness carrier for egress helper {helper}")
+
+            if "sandbox-escape" in m["commands"]["grants"] and dest != "none":
+                emit(target, mode, "sandbox-escape", sh_call(
+                    "run_agent_check", target, mode, runner, "sandbox-escape",
+                    f"sandbox-escape write-marker {target}-{mode} {marker(target, mode, 'sandbox-escape')}",
+                    marker(target, mode, "sandbox-escape"), f"{target}-{mode}",
+                ))
+
+            if m["egress"]["destinations"] != "any":
+                emit(target, mode, "network", sh_call(
+                    "run_agent_negative_check", target, mode, runner, "network",
+                    f"sh -lc 'curl -fsSL --max-time 5 https://example.com/ >/dev/null && printf network > {marker(target, mode, 'network')}'",
+                    marker(target, mode, "network"),
+                ))
+
+            emit(target, mode, "outside-write",
+                 sh_call("run_outside_write_negative_check", target, mode, runner))
+
+            if dest == "named":
+                emit(target, mode, "runbox", sh_call(
+                    "run_agent_negative_check", target, mode, runner, "runbox",
+                    f"sh -lc 'RUNBOX_CONTAINER=agents-box-test runbox true && printf runbox > {marker(target, mode, 'runbox')}'",
+                    marker(target, mode, "runbox"),
+                ))
+
+            planted = f"sandbox-escapes/planted-by-{mode.split('-', 1)[0]}"
+            emit(target, mode, "edit-escape", sh_call(
+                "run_agent_negative_check", target, mode, runner, "edit-escape",
+                f"sh -lc 'printf planted > {planted} && printf planted > {edit_escape_marker.replace('{target}', target)}'",
+                edit_escape_marker.replace("{target}", target), planted,
+            ))
+
+            if "gh-ro" in m["egress"].get("via", []):
+                for case in ("forge-pr-create", "forge-api-post", "forge-host-redirect"):
+                    index.add((target, mode, case))
+                lines.append(sh_call("run_development_forge_write_negative_checks", target, runner))
+
+            _common_agent_cases(spec, emit, target, mode)
+
+    lines.extend([
+        "",
+        "# forbidden: the mode's own configuration and git's escape surface stay unwritable.",
+    ])
+    for mode, m in spec["modes"].items():
+        if not m["commands"]["sandboxed_auto"]:
+            continue
+        for target in targets:
+            runner = runner_for(target)
+            emit(target, mode, "write-git-config", sh_call(
+                "run_forbidden_write_check", target, mode, runner,
+                "write-git-config", ".git/config", "AGENTS_MODES_FORBIDDEN_PROBE",
+            ))
+            emit(target, mode, "write-mode-config", sh_call(
+                "run_forbidden_write_check", target, mode, runner,
+                "write-mode-config", ".claude/settings.json", "AGENTS_MODES_FORBIDDEN_PROBE",
+            ))
+    lines.extend([
+        "",
+        "note \"live agent sessions used: $agent_session_count\"",
+        "",
+    ])
+    return lines, index
+
+
+def agent_case_index(spec):
+    return _agent_case_lines(spec)[1]
+
+
+def agent_cases_sh(spec):
+    lines = [
+        "# Generated from modes.json by tools/agents-modes-gen.",
+        "# Sourced by tests/agent-modes.sh after all case helper functions are defined.",
+        "",
+    ]
+    body, _ = _agent_case_lines(spec)
+    return "\n".join(lines + body)
+
+
+# ------------------------------------------------------------- seatbelt cases
+
+def _seatbelt_case_lines(profile, case):
+    """The concrete seatbelt probes for a coverage-row case, or None if unknown."""
+    def line(command, want, what):
+        return sh_call("seatbelt_case", profile, command, want, what)
+    if case == "seatbelt-workspace-read":
+        return [line("cat nested/readme.txt", "allow", "reading a non-secret workspace file")]
+    if case == "seatbelt-workspace-write":
+        return [line("printf x > nested/written.txt", "allow", "writing inside the workspace")]
+    if case in ("seatbelt-home-read", "seatbelt-home-read-denied"):
+        want = "allow" if case == "seatbelt-home-read" else "deny"
+        return [line('cat "$AGENTS_MODES_SEATBELT_HOME_PROBE"', want, "reading a non-secret home file")]
+    if case == "seatbelt-plant-escape":
+        return [line("mkdir -p sandbox-escapes && printf x > sandbox-escapes/planted", "deny",
+                     "planting a sandbox escape")]
+    if case == "seatbelt-container-write":
+        return [line("mkdir -p container && printf x > container/Dockerfile", "deny",
+                     "rewriting the box definition")]
+    if case == "seatbelt-git-config":
+        return [line("printf x > .git/agents-modes-probe", "allow", "writing a plain .git path"),
+                line("printf x >> .git/config", "deny", "writing .git/config"),
+                line("printf x > .git/hooks/pre-commit", "deny", "writing .git/hooks/pre-commit")]
+    if case == "seatbelt-home-secret-ssh":
+        return [line("cat ~/.ssh/id_rsa", "deny", "reading ~/.ssh/id_rsa")]
+    if case == "seatbelt-home-secret-aws":
+        return [line("cat ~/.aws/credentials", "deny", "reading ~/.aws/credentials")]
+    if case == "seatbelt-in-tree-env":
+        return [line("cat .env", "deny", "reading .env at the workspace root")]
+    if case == "seatbelt-in-tree-nested":
+        return [line("cat nested/.env", "deny", "reading a nested .env"),
+                line("cat nested/key.pem", "deny", "reading a nested *.pem"),
+                line("cat nested/id_rsa", "deny", "reading a nested id_rsa")]
+    if case == "seatbelt-curl":
+        return [line("curl -fsS --max-time 5 https://example.com/", "deny",
+                     "curl from a mode whose own sandbox has no egress")]
+    return None
+
+
+def seatbelt_cases_sh(spec):
+    """Seatbelt probes derived from the coverage rows, one source for list and matrix."""
+    lines = [
+        "# Generated from modes.json by tools/agents-modes-gen.",
+        "# Sourced by tests/live-codex-sandbox.sh after seatbelt_case is defined.",
+        "",
+    ]
+    for row in behavior_matrix(spec):
+        if row["runner"] != "seatbelt":
+            continue
+        emitted = _seatbelt_case_lines(f"agents-{row['mode']}", row["case"])
+        if emitted is None:
+            die(f"coverage row names an unknown seatbelt case: {row['case']}")
+        lines.extend(emitted)
+    lines.append("")
+    return "\n".join(lines)
+
+
+def witness_cases_sh(spec):
+    """Interactive witness runs derived from the approval witness matrix.
+
+    One line per carrier and decision, deny before accept, so the harness stages every
+    session and the human only answers the dialog. This is the authoritative runner for
+    the `manual` rows.
+    """
+    lines = [
+        "# Generated from modes.json by tools/agents-modes-gen.",
+        "# Sourced by tests/live-witness.sh; one line per interactive witness run.",
+        "",
+    ]
+    seen = set()
+    for row in approval_witness_matrix(spec):
+        key = (row["target"], row["mode"], row["case"])
+        if key in seen:
+            continue
+        seen.add(key)
+        covers = ", ".join(row["covers"])
+        for decision in ("deny", "accept"):
+            lines.append(sh_call("run_witness_case", row["target"], row["mode"],
+                                 row["case"], decision, covers))
+    lines.append("")
+    return "\n".join(lines)
+
+
+def approval_cases_sh(spec):
+    lines = [
+        "# Generated from modes.json by tools/agents-modes-gen.",
+        "# Experimental Codex TUI runner cases; not the authoritative approval witness.",
+        "",
+    ]
+    seen = set()
+    for row in approval_witness_matrix(spec):
+        if row["target"] != "codex":
+            continue
+        if row["check"] == "deny-prevents-execution":
+            decision = "deny"
+        elif row["check"] == "accept-runs-as-user":
+            decision = "accept"
+        else:
+            continue
+        key = (row["mode"], row["case"], decision)
+        if key in seen:
+            continue
+        seen.add(key)
+        lines.append(sh_call(
+            "run_codex_approval_case",
+            row["mode"], row["case"], decision,
+        ))
+    lines.append("")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------- lint
+
+def lint(root, spec):
+    problems = []
+    load_prompt_text(root)
+    helper_prompt_dir = os.path.join(root, "prompts", "helpers")
+    try:
+        prompt_helpers = {
+            os.path.splitext(name)[0]
+            for name in os.listdir(helper_prompt_dir)
+            if name.endswith(".md")
+        }
+    except OSError as exc:
+        die(f"cannot read helper prompt directory {helper_prompt_dir}: {exc}")
+    declared_helpers = set(spec["helpers"])
+    for helper in sorted(declared_helpers - prompt_helpers):
+        problems.append(f"helper has no prompt paragraph: {helper}")
+    for helper in sorted(prompt_helpers - declared_helpers):
+        problems.append(f"helper prompt has no declared helper: {helper}")
+    for name, m in spec["modes"].items():
+        if m["slug"] != name:
+            problems.append(f"{name}: slug is {m['slug']}")
+        if m["display"].lower() != m["slug"]:
+            problems.append(f"{name}: display {m['display']!r} does not lowercase to slug")
+        for helper in m["commands"]["grants"]:
+            if helper not in spec["helpers"]:
+                problems.append(f"{name}: grants unknown helper {helper}")
+        for server in m["mcp"]:
+            if server not in spec.get("mcp_servers", {}):
+                problems.append(f"{name}: grants unknown MCP server {server}")
+        via = m["egress"].get("via", [])
+        for helper in via:
+            if helper not in m["commands"]["grants"]:
+                problems.append(f"{name}: egress names {helper}, which is not granted")
+        dest = m["egress"]["destinations"]
+        if dest == "any" and not sandbox_network_open(spec, name):
+            # The web tools deliver the native leg by construction; commands need a boxed
+            # route, or the cell's `*` is only half true for the mode's shell work.
+            if not any(spec["helpers"][h].get("grants_egress")
+                       for h in m["commands"]["grants"]):
+                problems.append(f"{name}: egress is any with the sandbox shut, but no granted helper reaches the network")
+        if dest == "none":
+            for helper in m["commands"]["grants"]:
+                if spec["helpers"][helper].get("grants_egress"):
+                    problems.append(f"{name}: egress is off but grants {helper}, which reaches the network")
+
+    matrix = behavior_matrix(spec)
+    for row in matrix:
+        if row["runner"] not in COVERAGE_RUNNERS:
+            problems.append(f"coverage row has unknown runner {row['runner']!r}: {row['case']}")
+        if row["outcome"] not in COVERAGE_OUTCOMES:
+            problems.append(f"coverage row has unknown outcome {row['outcome']!r}: {row['case']}")
+        if row["runner"] == "seatbelt" and _seatbelt_case_lines("agents-x", row["case"]) is None:
+            problems.append(f"coverage row names an unknown seatbelt case: {row['case']}")
+    for target in ("claude", "codex"):
+        for mode in spec["modes"]:
+            for axis in COVERAGE_AXES:
+                if not any(r["target"] == target and r["mode"] == mode and r["axis"] == axis
+                           for r in matrix):
+                    problems.append(f"{target}-{mode}: no coverage row for axis {axis}")
+            positive_case = command_positive_case(spec, mode)
+            boundary_case = command_boundary_case(spec, mode)
+            for case, outcome in ((positive_case, "runs"),
+                                  (boundary_case, "blocked-or-prompted")):
+                if not any(r["target"] == target and r["mode"] == mode
+                           and r["case"] == case and r["outcome"] == outcome
+                           for r in matrix):
+                    problems.append(f"{target}-{mode}: behavior matrix misses {case}/{outcome}")
+            for check in ("prompt-appears", "deny-prevents-execution", "accept-runs-as-user"):
+                covering = [r for r in approval_witness_matrix(spec)
+                            if r["target"] == target and r["check"] == check
+                            and mode in r["covers"]]
+                if len(covering) != 1:
+                    problems.append(f"{target}-{mode}: approval witness covers {check} {len(covering)} times")
+
+    # The coverage matrix and the agent-case schedule must agree in both directions:
+    # a row claiming a case that is never emitted fails, and an emitted case no row
+    # claims fails. This is what keeps the schedule from drifting back to one-off cases.
+    index = agent_case_index(spec)
+    agent_rows = {(r["target"], r["mode"], r["case"]) for r in matrix if r["runner"] == "agent"}
+    for key in sorted(agent_rows - index):
+        problems.append(f"coverage row claims an agent case the schedule never emits: {key}")
+    for key in sorted(index - agent_rows):
+        problems.append(f"agent-cases-sh emits a case no coverage row claims: {key}")
+
+    for gap in spec.get("gaps", []):
+        for field in ("axis", "targets", "modes", "desired", "actual", "status"):
+            if not gap.get(field):
+                problems.append(f"table gap missing field: {field}")
+    for target, target_spec in spec.get("targets", {}).items():
+        for gap in target_spec.get("gaps", []):
+            for field in ("axis", "modes", "desired", "actual", "status"):
+                if not gap.get(field):
+                    problems.append(f"{target} target gap missing field: {field}")
+    run_as_user = spec.get("targets", {}).get("codex", {}).get("run_as_user", {})
+    for field in ("server", "tool", "executable", "source", "approval_mode"):
+        if not run_as_user.get(field):
+            problems.append(f"targets.codex.run_as_user missing {field}")
+    if run_as_user:
+        if run_as_user.get("server") != "run_as_user":
+            problems.append("targets.codex.run_as_user.server must be run_as_user")
+        if run_as_user.get("tool") != "run_as_user":
+            problems.append("targets.codex.run_as_user.tool must be run_as_user")
+        if run_as_user.get("approval_mode") != "prompt":
+            problems.append("targets.codex.run_as_user.approval_mode must be prompt")
+        if run_as_user.get("server") in spec.get("mcp_servers", {}):
+            problems.append("targets.codex.run_as_user.server collides with a mode-granted MCP server")
+        if not re.fullmatch(r"[a-z][a-z0-9-]*", run_as_user.get("executable", "")):
+            problems.append("targets.codex.run_as_user.executable must be a plain executable name")
+        if os.path.basename(run_as_user.get("source", "")) != run_as_user.get("executable"):
+            problems.append("targets.codex.run_as_user source basename differs from executable")
+    integration_policy = spec.get("integration_policy", {})
+    if integration_policy.get("default") != "closed":
+        problems.append("integration_policy.default must be closed")
+    for field in ("why", "caveat", "authority", "trusted_inputs", "surfaces"):
+        if not integration_policy.get(field):
+            problems.append(f"integration_policy missing {field}")
+    for target in ("claude", "codex"):
+        if not spec.get("compatibility", {}).get(target, {}).get("last_verified"):
+            problems.append(f"compatibility.{target}.last_verified is required")
+    for helper, helper_spec in spec["helpers"].items():
+        if not re.fullmatch(r"[a-z][a-z0-9-]*", helper):
+            problems.append(f"helper name is interpolated into TOML/JSON/PATH: {helper!r}")
+        source = helper_spec.get("source", "")
+        if not source:
+            problems.append(f"helper has no install source: {helper}")
+        elif os.path.basename(source) != helper:
+            problems.append(f"helper source basename differs from its name: {helper} -> {source}")
+    for entry in spec["secrets"]["home"]:
+        if entry["kind"] not in ("tree", "file"):
+            problems.append(f"secrets: {entry['path']} has kind {entry['kind']!r}")
+    if problems:
+        for p in problems:
+            print(f"agents-modes-gen: lint: {p}", file=sys.stderr)
+        raise SystemExit(1)
+    return 0
+
+
+# ---------------------------------------------------------------------- main
+
+def write_out(text, path):
+    if path is None:
+        sys.stdout.write(text)
+        return
+    # Write-then-rename: a crash must not leave a truncated settings file on the share
+    # dir, which `jq ... > $out` in the old Makefile could do.
+    tmp = path + ".new"
+    with open(tmp, "w") as fh:
+        fh.write(text)
+    os.replace(tmp, path)
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="agents-modes-gen")
+    ap.add_argument("command", choices=["claude-settings", "claude-mcp-config",
+                                        "codex-profile", "codex-session-config", "manifest",
+                                        "codex-rules", "container-policy-sh", "prompt",
+                                        "mode-list", "runtime-helper-list",
+                                        "codex-run-as-user-source",
+                                        "readme-block", "readme-extract", "agent-cases-sh",
+                                        "seatbelt-cases-sh", "approval-cases-sh",
+                                        "witness-cases-sh", "behavior-matrix-json",
+                                        "approval-witness-matrix-json", "conformance-matrix-json",
+                                        "lint"])
+    ap.add_argument("mode", nargs="?")
+    ap.add_argument("file", nargs="?")
+    ap.add_argument("--output")
+    ap.add_argument("--root", default=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    args = ap.parse_args()
+
+    spec = load_spec(args.root)
+    if args.command == "lint":
+        return lint(args.root, spec)
+    lint(args.root, spec)
+    if args.command == "mode-list":
+        write_out(" ".join(spec["modes"]) + "\n", args.output)
+        return 0
+    if args.command == "runtime-helper-list":
+        write_out(runtime_helper_list(spec), args.output)
+        return 0
+    if args.command == "codex-run-as-user-source":
+        write_out(codex_run_as_user_source(spec), args.output)
+        return 0
+    if args.command == "codex-rules":
+        write_out(codex_rules(spec), args.output)
+        return 0
+    if args.command == "container-policy-sh":
+        write_out(container_policy_sh(spec), args.output)
+        return 0
+    if args.command == "agent-cases-sh":
+        write_out(agent_cases_sh(spec), args.output)
+        return 0
+    if args.command == "seatbelt-cases-sh":
+        write_out(seatbelt_cases_sh(spec), args.output)
+        return 0
+    if args.command == "witness-cases-sh":
+        write_out(witness_cases_sh(spec), args.output)
+        return 0
+    if args.command == "approval-cases-sh":
+        write_out(approval_cases_sh(spec), args.output)
+        return 0
+    if args.command == "behavior-matrix-json":
+        write_out(json.dumps(behavior_matrix(spec), indent=2) + "\n", args.output)
+        return 0
+    if args.command == "approval-witness-matrix-json":
+        write_out(json.dumps(approval_witness_matrix(spec), indent=2) + "\n", args.output)
+        return 0
+    if args.command == "conformance-matrix-json":
+        write_out(json.dumps(conformance_matrix(spec), indent=2) + "\n", args.output)
+        return 0
+    if not args.mode:
+        die(f"{args.command} needs an argument")
+
+    if args.command == "readme-block":
+        if args.mode not in README_BLOCKS:
+            die(f"unknown README block: {args.mode} (have: {', '.join(README_BLOCKS)})")
+        write_out(README_BLOCKS[args.mode](spec), args.output)
+        return 0
+    if args.command == "readme-extract":
+        if not args.file:
+            die("readme-extract needs a block name and a file")
+        write_out(readme_extract(args.mode, args.file), args.output)
+        return 0
+    if args.command == "prompt":
+        if not args.file:
+            die("prompt needs a target and mode")
+        write_out(prompt_text(args.root, spec, args.mode, args.file), args.output)
+        return 0
+
+    if args.command == "claude-settings":
+        text = json.dumps(claude_settings(spec, args.mode), indent=2) + "\n"
+    elif args.command == "claude-mcp-config":
+        text = json.dumps(claude_mcp_config(spec, args.mode), indent=2) + "\n"
+    elif args.command == "codex-session-config":
+        text = codex_session_config(spec, args.mode)
+    elif args.command == "manifest":
+        text = json.dumps(manifest(spec, args.mode), indent=2) + "\n"
+    else:
+        frag_path = os.path.join(args.root, "codex", "tui.config.toml")
+        try:
+            with open(frag_path) as fh:
+                fragment = fh.read()
+        except OSError as exc:
+            die(f"cannot read {frag_path}: {exc}")
+        text = codex_profile(spec, args.mode, fragment)
+    write_out(text, args.output)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

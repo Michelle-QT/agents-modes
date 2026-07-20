@@ -1,0 +1,281 @@
+#!/usr/bin/env -S BASH_ENV= ENV= /bin/bash
+# gh-ro — read-only GitHub CLI, Development mode's forge-read escape.
+#
+# Development mode runs every command inside the OS sandbox, which blocks all network
+# egress. Like `fetch-all`, this script is a deliberate exception: it is named in
+# the mode's `sandbox.excludedCommands`, so it runs OUTSIDE the sandbox, reaches
+# the forge API, and can read gh's stored credentials. It execs the real `gh`,
+# but only for read-only subcommands; anything that can write is refused here.
+#
+# Contract (keep these; they are what make the escape safe):
+#   - Trusted bootstrap: clear shell startup hooks before invoking a fixed Bash path.
+#   - Read-only toward the forge: forward only the allowlist below to `gh`.
+#   - Pinned to github.com: reject every user-controlled host selector, derive current-repo
+#     context only from a github.com remote, and run gh outside the project directory so it
+#     cannot infer a different host from local git configuration.
+#   - Minimal environment: gh's jq engine can read its complete environment, so exec gh with
+#     only non-secret, wrapper-controlled values and use the trusted gh config for authentication.
+#   - Plain `gh` is NOT excluded, so a real `gh` write stays sandboxed and gated.
+#     Forge writes therefore have no no-ask path: `gh pr create` crosses the
+#     target boundary, and `gh-ro pr create` is refused below.
+#   - Installed on PATH where the sandbox cannot write, so a sandboxed agent
+#     cannot alter this script.
+#
+# Soundness is best-effort, like fetch-all's: it rests on this allowlist, not on
+# the OS. The excluded token `gh-ro` is a prefix (it takes arguments), so the
+# allowlist, not an exact-token match, is the gate. Keep it read-only.
+#
+# Invoke standalone. Claude Code splits a command on `| && || ; & |&` and matches
+# each segment, so the excludedCommands entry must be globbed (`gh-ro *`) to match
+# this with arguments, and a pipe (`gh-ro ... | head`) re-sandboxes the whole line
+# (it then fails on the network/config block). Shape output with gh's own
+# `--json`/`--jq`/`--template`, not a pipe.
+set -euo pipefail
+
+codex_helper_path="${BASH_SOURCE[0]}"
+case "$codex_helper_path" in
+  */*) codex_helper_path="${codex_helper_path%/*}" ;;
+  *) codex_helper_path="." ;;
+esac
+codex_helper_dir="$(cd "$codex_helper_path" && pwd -P)"
+codex_dispatch_client="$codex_helper_dir/codex-dispatch-client.sh"
+if [ -f "$codex_dispatch_client" ]; then
+  # shellcheck source=/dev/null
+  . "$codex_dispatch_client"
+  codex_forward_helper_if_active "${BASH_SOURCE[0]##*/}" "$@"
+fi
+
+deny() {
+  echo "gh-ro: read-only gh; refused: gh $*" >&2
+  echo "gh-ro: allowed: <pr|issue|repo|run|workflow|release|gist|label|cache> view|list|diff|checks|status; search ...; api (GET only)" >&2
+  exit 2
+}
+
+if { [ -n "${CODEX_SANDBOX:-}" ] || [ -n "${AGENTS_CODEX_MODE:-}" ]; } && [ "${AGENTS_CODEX_MODE:-}" != "development" ]; then
+  deny "available only in Codex Development mode"
+fi
+if [ -n "${AGENTS_CLAUDE_MODE:-}" ] && [ "$AGENTS_CLAUDE_MODE" != "development" ]; then
+  deny "available only in Claude Development mode"
+fi
+
+find_gh() {
+  local candidate
+  for candidate in /opt/homebrew/bin/gh /usr/local/bin/gh /usr/bin/gh; do
+    [ -x "$candidate" ] && { printf '%s\n' "$candidate"; return 0; }
+  done
+  return 1
+}
+
+find_git() {
+  local candidate
+  for candidate in /opt/homebrew/bin/git /usr/local/bin/git /usr/bin/git; do
+    [ -x "$candidate" ] && { printf '%s\n' "$candidate"; return 0; }
+  done
+  return 1
+}
+
+find_env() {
+  local candidate
+  for candidate in /usr/bin/env /bin/env; do
+    [ -x "$candidate" ] && { printf '%s\n' "$candidate"; return 0; }
+  done
+  return 1
+}
+
+find_account_home() {
+  local id_bin user record key value home getent_bin
+  for id_bin in /usr/bin/id /bin/id; do
+    [ -x "$id_bin" ] && break
+  done
+  [ -x "$id_bin" ] || return 1
+  user="$("$id_bin" -un)" || return 1
+  if [ -x /usr/bin/dscacheutil ]; then
+    record="$(/usr/bin/dscacheutil -q user -a name "$user")" || return 1
+    while IFS=: read -r key value; do
+      if [ "$key" = "dir" ]; then
+        home="${value# }"
+        case "$home" in
+          /*) printf '%s\n' "$home"; return 0 ;;
+        esac
+      fi
+    done <<< "$record"
+  fi
+  for getent_bin in /usr/bin/getent /bin/getent; do
+    [ -x "$getent_bin" ] || continue
+    record="$("$getent_bin" passwd "$user")" || continue
+    IFS=: read -r _ _ _ _ _ home _ <<< "$record"
+    case "$home" in
+      /*) printf '%s\n' "$home"; return 0 ;;
+    esac
+  done
+  return 1
+}
+
+validate_repo_selector() {
+  local value="$1" owner repo
+  case "$value" in
+    ""|-*|/*|*:*|*[$'\n\r\t ']*|*/*/*|*[^A-Za-z0-9._/-]*) deny "$@" ;;
+  esac
+  owner="${value%%/*}"
+  repo="${value#*/}"
+  [ "$owner" != "$value" ] && [ -n "$owner" ] && [ -n "$repo" ] || deny "$@"
+  [ "$owner" != "." ] && [ "$owner" != ".." ] && [ "$repo" != "." ] && [ "$repo" != ".." ] || deny "$@"
+}
+
+parse_github_repo_url() {
+  local url="$1" path owner repo
+  case "$url" in
+    https://github.com/*) path="${url#https://github.com/}" ;;
+    git@github.com:*) path="${url#git@github.com:}" ;;
+    ssh://git@github.com/*) path="${url#ssh://git@github.com/}" ;;
+    ssh://github.com/*) path="${url#ssh://github.com/}" ;;
+    git://github.com/*) path="${url#git://github.com/}" ;;
+    *) return 1 ;;
+  esac
+  path="${path%.git}"
+  case "$path" in
+    ""|/*|*[$'\n\r\t ']*|*/*/*|*[^A-Za-z0-9._/-]*) return 1 ;;
+  esac
+  owner="${path%%/*}"
+  repo="${path#*/}"
+  [ "$owner" != "$path" ] && [ -n "$owner" ] && [ -n "$repo" ] || return 1
+  printf '%s/%s\n' "$owner" "$repo"
+}
+
+current_github_repo() {
+  local git_bin branch remote url
+  git_bin="$(find_git)" || return 1
+  "$git_bin" rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 1
+  branch="$("$git_bin" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+  remote=""
+  if [ -n "$branch" ]; then
+    remote="$("$git_bin" config --get "branch.$branch.remote" 2>/dev/null || true)"
+  fi
+  [ -n "$remote" ] || remote="origin"
+  case "$remote" in
+    -*|*[$'\n\r\t ']*) return 1 ;;
+  esac
+  url="$("$git_bin" remote get-url "$remote" 2>/dev/null || true)"
+  parse_github_repo_url "$url"
+}
+
+repo_view_target=""
+validate_repo_view_target() {
+  local index=3 arg
+  while [ "$index" -le "$#" ]; do
+    arg="${!index}"
+    case "$arg" in
+      -b|--branch|-q|--jq|--json|-t|--template)
+        index=$((index + 2))
+        continue
+        ;;
+      --branch=*|--jq=*|--json=*|--template=*|--help|-*)
+        ;;
+      *)
+        validate_repo_selector "$arg"
+        repo_view_target="$arg"
+        return 0
+        ;;
+    esac
+    index=$((index + 1))
+  done
+}
+
+[ "$#" -ge 1 ] || deny "(no arguments)"
+
+cmd="$1"
+sub="${2:-}"
+
+noun_re='^(pr|issue|repo|run|workflow|release|gist|label|cache|ruleset)$'
+verb_re='^(view|list|diff|checks|status)$'
+
+case "$cmd" in
+  search)
+    : # gh search code|commits|issues|prs|repos — all read-only
+    ;;
+  api)
+    # Allow GET only: refuse body/field flags (they switch gh to POST) and any
+    # explicit non-GET method.
+    prev=""
+    for a in "$@"; do
+      case "$a" in
+        graphql|*/graphql|graphql\?*|*/graphql\?*) deny "$@" ;;
+        -f|-F|-f?*|-F?*|-H|-H?*|--field|--field=*|--raw-field|--raw-field=*|--header|--header=*|--input|--input=*|--cache|--cache=*) deny "$@" ;;
+        --method=*) m="${a#--method=}" ;;
+        -X?*)       m="${a#-X}" ;;
+        *)          m="" ;;
+      esac
+      if [ "$prev" = "-X" ] || [ "$prev" = "--method" ]; then m="$a"; fi
+      if [ -n "$m" ]; then
+        case "$m" in
+          [Gg][Ee][Tt]) ;;
+          *) deny "$@" ;;
+        esac
+      fi
+      prev="$a"
+    done
+    ;;
+  *)
+    { [[ "$cmd" =~ $noun_re ]] && [[ "$sub" =~ $verb_re ]]; } || deny "$@"
+    ;;
+esac
+
+explicit_repo=""
+index=1
+while [ "$index" -le "$#" ]; do
+  a="${!index}"
+  case "$a" in
+    --hostname|--hostname=*|*://*|//*|--web|-w)
+      deny "$@"
+      ;;
+    -R|--repo)
+      index=$((index + 1))
+      [ "$index" -le "$#" ] || deny "$@"
+      value="${!index}"
+      validate_repo_selector "$value" "$@"
+      explicit_repo="$value"
+      ;;
+    -R?*)
+      value="${a#-R}"
+      validate_repo_selector "$value" "$@"
+      explicit_repo="$value"
+      ;;
+    --repo=*)
+      value="${a#--repo=}"
+      validate_repo_selector "$value" "$@"
+      explicit_repo="$value"
+      ;;
+  esac
+  index=$((index + 1))
+done
+
+if [ "$cmd" = "repo" ] && [ "$sub" = "view" ]; then
+  validate_repo_view_target "$@"
+  [ -z "$repo_view_target" ] || explicit_repo="$repo_view_target"
+fi
+
+GH_BIN="$(find_gh)" || deny "gh not found on a trusted absolute path"
+ENV_BIN="$(find_env)" || deny "env not found on a trusted absolute path"
+trusted_home="$(find_account_home)" || deny "could not resolve the current account home"
+gh_repo_env=()
+if [ -n "$explicit_repo" ]; then
+  gh_repo_env=("GH_REPO=github.com/$explicit_repo")
+else
+  repo_target="$(current_github_repo || true)"
+  [ -z "$repo_target" ] || gh_repo_env=("GH_REPO=github.com/$repo_target")
+fi
+
+cd /
+exec "$ENV_BIN" -i \
+  "HOME=$trusted_home" \
+  "PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+  "TMPDIR=/tmp" \
+  "GH_CONFIG_DIR=$trusted_home/.config/gh" \
+  "GH_HOST=github.com" \
+  "GH_NO_UPDATE_NOTIFIER=1" \
+  "GH_NO_EXTENSION_UPDATE_NOTIFIER=1" \
+  "GH_PROMPT_DISABLED=1" \
+  "GH_PAGER=/bin/cat" \
+  "PAGER=/bin/cat" \
+  "${gh_repo_env[@]}" \
+  "$GH_BIN" "$@"

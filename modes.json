@@ -1,0 +1,483 @@
+{
+  "$comment": [
+    "The capability table, stated once. README.md renders it for humans; tests/test-table.sh",
+    "asserts the installed artifacts against it. Configs, manifests, prompt facts, and README",
+    "blocks generate from this file.",
+    "",
+    "Vocabulary matches README.md's Entries section. `read`/`write` name a region; `egress`",
+    "names which destinations are reachable, not the route taken to reach them; `commands`",
+    "names how a shell command is treated."
+  ],
+  "command_outcomes": {
+    "auto": "The command runs without asking.",
+    "prompt_deny": "The command prompts the user; if the user denies it, the command does not run.",
+    "prompt_accept": "The command prompts the user; if the user accepts it, the command runs as the user with the user's normal credentials and permissions."
+  },
+  "secrets": {
+    "why": "denied to automatic tools, sandboxed commands, and `runbox`; deliberate shell access follows the `outside → prompt` command rule",
+    "$comment_kind": "kind is data, not something an emitter can infer: a dotted last segment says nothing about it (~/.aws is a tree, ~/.config/git/credentials is a file). A tree needs a bare rule and a recursive one; a file needs one rule.",
+    "home": [
+      {
+        "path": "~/.aws",
+        "kind": "tree"
+      },
+      {
+        "path": "~/.ssh",
+        "kind": "tree"
+      },
+      {
+        "path": "~/.gnupg",
+        "kind": "tree"
+      },
+      {
+        "path": "~/.config/gcloud",
+        "kind": "tree"
+      },
+      {
+        "path": "~/.azure",
+        "kind": "tree"
+      },
+      {
+        "path": "~/.kube",
+        "kind": "tree"
+      },
+      {
+        "path": "~/.docker/config.json",
+        "kind": "file"
+      },
+      {
+        "path": "~/.config/gh",
+        "kind": "tree"
+      },
+      {
+        "path": "~/.netrc",
+        "kind": "file"
+      },
+      {
+        "path": "~/.npmrc",
+        "kind": "file"
+      },
+      {
+        "path": "~/.pypirc",
+        "kind": "file"
+      },
+      {
+        "path": "~/.git-credentials",
+        "kind": "file"
+      },
+      {
+        "path": "~/.config/git/credentials",
+        "kind": "file"
+      },
+      {
+        "path": "~/.terraform.d",
+        "kind": "tree"
+      },
+      {
+        "path": "~/.config/op",
+        "kind": "tree"
+      },
+      {
+        "path": "~/.password-store",
+        "kind": "tree"
+      },
+      {
+        "path": "~/.claude/.credentials.json",
+        "kind": "file"
+      },
+      {
+        "path": "~/.codex/auth.json",
+        "kind": "file"
+      },
+      {
+        "path": "~/.local/share/agents-modes/codex-sessions",
+        "kind": "tree"
+      }
+    ],
+    "in_tree": [
+      "**/.env",
+      "**/.env.*",
+      "**/*.pem",
+      "**/*.key",
+      "**/id_rsa",
+      "**/id_ed25519"
+    ],
+    "carriers": {
+      "claude": "permissions.deny Read() rules. sandbox.filesystem.* governs sandboxed Bash only; Read/Edit/Write go through the permission system and never touch the sandbox, so a denyRead entry stops `cat` and does nothing about Read. A Read() deny rule covers both, and deny is evaluated before ask and allow. sandbox.credentials is not a lever here: it affects sandboxed Bash commands only.",
+      "codex": "filesystem deny keys protect automatic and sandboxed access. Home paths are denied in the top-level filesystem table; in-tree patterns are denied in the workspace-roots table so they do not become host-wide globs that catch OS trust-store files. Deliberate access uses the always-prompt run_as_user command carrier."
+    }
+  },
+  "forbidden": {
+    "why": "readable, never writable without prompting, in any mode, because writing them changes what the agent is allowed to do",
+    "groups": [
+      {
+        "why": "a writable remote URL or hook redirects `fetch-all` or runs code; the rest of `.git` stays writable so `git commit` works",
+        "paths": [
+          {
+            "path": ".git/config",
+            "scope": "project",
+            "kind": "file"
+          },
+          {
+            "path": ".git/hooks",
+            "scope": "project",
+            "kind": "tree"
+          }
+        ]
+      },
+      {
+        "why": "the escape surface and the box definition",
+        "paths": [
+          {
+            "path": "sandbox-escapes",
+            "scope": "project",
+            "kind": "tree"
+          },
+          {
+            "path": "container",
+            "scope": "project",
+            "kind": "tree"
+          }
+        ]
+      },
+      {
+        "why": "the mode's own configuration",
+        "paths": [
+          {
+            "path": ".claude/settings.json",
+            "scope": "project",
+            "kind": "file"
+          },
+          {
+            "path": ".claude/settings.local.json",
+            "scope": "project",
+            "kind": "file"
+          },
+          {
+            "path": ".codex",
+            "scope": "project",
+            "kind": "tree"
+          },
+          {
+            "path": ".mcp.json",
+            "scope": "project",
+            "kind": "file"
+          },
+          {
+            "path": "~/.codex/config.toml",
+            "scope": "home",
+            "kind": "file"
+          },
+          {
+            "path": "~/.local/share/agents-modes",
+            "scope": "home",
+            "kind": "tree"
+          },
+          {
+            "path": "~/.local/share/claude-modes",
+            "scope": "home",
+            "kind": "tree"
+          }
+        ]
+      }
+    ],
+    "excluded": {
+      "~/.local/bin": "the default helper and launcher directory is already outside every mode's writable region, while launchers dynamically protect the actual helper directory; a hard deny on the user's general bin directory would read as a guard the modes do not need"
+    }
+  },
+  "gaps": [
+    {
+      "axis": "secrets",
+      "targets": [
+        "claude",
+        "codex"
+      ],
+      "modes": [
+        "research"
+      ],
+      "desired": "in-tree secrets are unreadable inside the Research container for the whole session",
+      "actual": "runbox's unreadable overlays are computed once at box_start, so a file matching a secret pattern created after launch is readable inside the box",
+      "status": "masked at launch only"
+    },
+    {
+      "axis": "read",
+      "targets": [
+        "claude"
+      ],
+      "modes": [
+        "research"
+      ],
+      "desired": "sandboxed commands read only the launched project",
+      "actual": "the sandboxed leg denies the home tree and re-allows the project, because a command must read /bin/sh and the TLS trust store to run; literal workdir confinement is not implementable there",
+      "status": "host minus home by design"
+    }
+  ],
+  "helpers": {
+    "sandbox-escape": {
+      "source": "helpers/sandbox-escape",
+      "grants_egress": false
+    },
+    "fetch-all": {
+      "source": "modes/development/fetch-all",
+      "grants_egress": true
+    },
+    "ls-remote": {
+      "source": "modes/development/ls-remote",
+      "grants_egress": true
+    },
+    "gh-ro": {
+      "source": "modes/development/gh-ro",
+      "grants_egress": true
+    },
+    "runbox": {
+      "source": "container/runbox",
+      "grants_egress": true,
+      "needs_container": true
+    }
+  },
+  "integration_policy": {
+    "default": "closed",
+    "surfaces": [
+      "user and project settings",
+      "hooks",
+      "rules",
+      "plugins",
+      "apps and connectors",
+      "browser and computer use",
+      "native image generation",
+      "MCP servers not named by the mode or a target carrier"
+    ],
+    "why": "a permission mode aims to control every user-configurable native route that can read, write, execute, or reach an external service; target-specific exceptions are recorded as gaps",
+    "caveat": "Claude currently loads its default user, project, and local settings, and Codex loads its user config, so personal settings remain available; the user is responsible for ensuring that inherited settings contain no dangerous integrations",
+    "authority": "Organization-managed policy remains authoritative on both targets and is outside the user-configurable mode matrix",
+    "trusted_inputs": "Runtime artifact-root, authentication, and invocation environment variables are trusted launch inputs set before the agent starts; custom roots are not authenticated by the launchers"
+  },
+  "mcp_servers": {
+    "zotero": {
+      "command": "zotero-mcp",
+      "args": [
+        "serve"
+      ]
+    }
+  },
+  "compatibility": {
+    "claude": {
+      "last_verified": "2.1.214"
+    },
+    "codex": {
+      "last_verified": "0.144.5"
+    }
+  },
+  "modes": {
+    "research": {
+      "slug": "research",
+      "display": "Research",
+      "read": {
+        "region": "workdir",
+        "minus": [
+          "secrets"
+        ]
+      },
+      "write": {
+        "region": "workdir",
+        "minus": [
+          "secrets",
+          "forbidden"
+        ],
+        "plus": []
+      },
+      "egress": {
+        "destinations": "any"
+      },
+      "mcp": [
+        "zotero"
+      ],
+      "commands": {
+        "sandboxed_auto": false,
+        "grants": [
+          "runbox"
+        ],
+        "outside": "prompt"
+      }
+    },
+    "development": {
+      "slug": "development",
+      "display": "Development",
+      "read": {
+        "region": "host",
+        "minus": [
+          "secrets"
+        ]
+      },
+      "write": {
+        "region": "workdir",
+        "minus": [
+          "secrets",
+          "forbidden"
+        ],
+        "plus": [
+          "/tmp"
+        ]
+      },
+      "egress": {
+        "destinations": "named",
+        "via": [
+          "fetch-all",
+          "ls-remote",
+          "gh-ro"
+        ],
+        "why": "wrapper guarantees, not OS ones: the no-argument helpers have exact un-injectable tokens, and gh-ro's own script is the gate"
+      },
+      "mcp": [],
+      "commands": {
+        "sandboxed_auto": true,
+        "grants": [
+          "sandbox-escape",
+          "fetch-all",
+          "ls-remote",
+          "gh-ro"
+        ],
+        "outside": "prompt"
+      }
+    },
+    "networked-development": {
+      "slug": "networked-development",
+      "display": "Networked-development",
+      "read": {
+        "region": "host",
+        "minus": [
+          "secrets"
+        ]
+      },
+      "write": {
+        "region": "workdir",
+        "minus": [
+          "secrets",
+          "forbidden"
+        ],
+        "plus": [
+          "/tmp"
+        ]
+      },
+      "egress": {
+        "destinations": "any"
+      },
+      "mcp": [],
+      "commands": {
+        "sandboxed_auto": true,
+        "grants": [
+          "sandbox-escape"
+        ],
+        "outside": "prompt"
+      }
+    },
+    "sealed-development": {
+      "slug": "sealed-development",
+      "display": "Sealed-development",
+      "read": {
+        "region": "host",
+        "minus": [
+          "secrets"
+        ]
+      },
+      "write": {
+        "region": "workdir",
+        "minus": [
+          "secrets",
+          "forbidden"
+        ],
+        "plus": [
+          "/tmp"
+        ]
+      },
+      "egress": {
+        "destinations": "none"
+      },
+      "mcp": [],
+      "commands": {
+        "sandboxed_auto": true,
+        "grants": [
+          "sandbox-escape"
+        ],
+        "outside": "prompt"
+      }
+    }
+  },
+  "targets": {
+    "claude": {
+      "tmp_paths": [
+        "/tmp",
+        "/private/tmp"
+      ],
+      "carriers": {
+        "read": "the presence of a bare `Read` allow rule. Built-in Read/Glob/Grep default to no-approval within the working directory plus additionalDirectories and require approval outside it, so a bare `Read` allow (meaning: never prompt) widens the region to `host`. `region: workdir` therefore means NO bare Read allow rule. There is no :workspace token and deny rules take no exceptions, so this is the only expressible mechanism; `allowRead` is not it, and the repo has none.",
+        "write": "sandbox.filesystem.allowWrite plus permissions.additionalDirectories for the `plus` paths; sandbox.filesystem.denyWrite for `forbidden`; the session renderer also protects the actual settings, prompt, and helper roots when install-path overrides are used",
+        "egress": "sandbox.network.allowedDomains for `any`; absent for `none`; sandbox.excludedCommands for `named`",
+        "mcp": "an explicit per-mode --mcp-config plus --strict-mcp-config; an `mcp__<server>__*` allow rule exists for every configured server and no inherited server is loaded",
+        "commands": "a bare `Bash` allow delivers `sandboxed auto` (without it, even a fully sandboxed loop prompts); autoAllowBashIfSandboxed gates the same; `ask: Bash(dangerouslyDisableSandbox:true)` forces a prompt on the generic route out of the sandbox (excludedCommands are the named, per-helper route out), because ask beats allow",
+        "web_tools": "WebFetch/WebSearch allow rules, granted where egress.destinations == \"any\". Derived, not declared: the web tools are one route to unrestricted egress, so a mode that can reach any destination gets them and a mode with named or no egress does not. Codex renders the same fact as web_search = \"live\"/\"disabled\".",
+        "integrations": "Claude's default user, project, and local setting sources are currently loaded; --strict-mcp-config still admits only the generated per-mode MCP file; --no-chrome disables the browser integration; launcher arguments and management subcommands that replace or mutate policy, integrations, project roots, helpers, or mode configuration are rejected"
+      },
+      "gaps": [
+        {
+          "axis": "integrations",
+          "modes": [
+            "research",
+            "development",
+            "networked-development",
+            "sealed-development"
+          ],
+          "actual": "Claude's default user, project, and local setting sources are loaded so personal skills and interface settings remain available",
+          "desired": "inherited user-configurable integrations are disabled unless explicitly admitted by the mode",
+          "status": "user, project, and local settings are trusted temporarily"
+        }
+      ]
+    },
+    "codex": {
+      "run_as_user": {
+        "server": "run_as_user",
+        "tool": "run_as_user",
+        "executable": "agents-run-as-user",
+        "source": "codex/helpers/agents-run-as-user",
+        "approval_mode": "prompt"
+      },
+      "carriers": {
+        "read": "\":root\" = \"read\" for `host`; \":minimal\" = \"read\" for `workdir`",
+        "write": "\":workspace_roots\" entries; \":tmpdir\"/\":slash_tmp\"/\"/private/tmp\" for the `plus` paths",
+        "egress": "network.enabled, plus web_search for the web tools",
+        "mcp": "highest-precedence generated overrides add the always-prompt run_as_user command carrier plus exactly the servers named by the mode, whose granted tools are approved; user-configured servers are inherited temporarily, while project and plugin-provided servers remain excluded",
+        "commands": "Research uses approval_policy = \"untrusted\" plus a generated runbox allow rule, while the development family uses approval_policy = \"on-request\" so sandboxed commands run normally. Every boundary command uses the isolated run_as_user MCP tool, whose per-tool approval_mode is prompt; acceptance starts one child with the saved invocation environment, requested working directory, and invoking user's unrestricted host permissions. No-ask helpers still go through the mode-scoped launcher dispatcher.",
+        "integrations": "each launch gets a temporary CODEX_HOME whose base config is copied from the incoming user CODEX_HOME, with the generated mode config and profile layered above it; the project is recorded untrusted so project .codex config, hooks, and rules are ignored; generated settings disable known hooks, plugins, apps, browser, computer use, native image generation, and shell additional-permission approvals, while user model-provider settings and MCP servers remain available; the actual config and helper roots are read-only; launcher arguments and subcommands that replace or manage policy, integrations, project roots, helpers, or mode configuration are rejected"
+      },
+      "gaps": [
+        {
+          "axis": "integrations",
+          "modes": [
+            "research",
+            "development",
+            "networked-development",
+            "sealed-development"
+          ],
+          "desired": "inherited Codex user integrations are disabled unless explicitly admitted by the mode",
+          "actual": "Codex's user config is loaded so custom model providers and personal settings remain available; generated mode settings disable known integration features, but arbitrary user MCP servers remain loaded",
+          "status": "user settings are trusted temporarily"
+        },
+        {
+          "axis": "forbidden",
+          "modes": [
+            "research",
+            "development",
+            "networked-development",
+            "sealed-development"
+          ],
+          "desired": "project configuration and reserved paths are read-only whether or not their parent directories exist at launch",
+          "actual": "the rendered profile omits a nested read-only guard when its parent directory does not exist, because Codex 0.144.0's Bubblewrap backend otherwise fails before starting the sandbox; an absent guarded path can therefore be created during that session",
+          "status": "nonexistent nested guards are omitted for Bubblewrap compatibility"
+        }
+      ],
+      "notes": {
+        "git_write": "Codex's default sandbox makes .git read-only, so a workdir-writable mode re-grants .git and .git/** for local commits, then re-denies config and hooks. Verified: Codex resolves most-specific-wins even specific-vs-specific."
+      }
+    }
+  }
+}

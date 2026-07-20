@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# runbox — run a command inside this session's container (see the `runbox auto` entry in README.md).
+#
+# Research mode keeps host commands in a network-closed OS sandbox. `runbox` is the
+# no-ask path for arbitrary shell and network work: it forwards a command into a locked,
+# workdir-only container that the launcher started.
+# The inner command is unrestricted on purpose — the container is the boundary. It has
+# full internet, but the project working directory (bind-mounted at the same absolute
+# path) is its entire filesystem world, so exfiltration is bounded to the project tree.
+#
+# Contract (keep these properties; they are what make the escape safe):
+#   - Targets only the fixed session container named by $RUNBOX_CONTAINER, which the
+#     launcher exports. The agent cannot pick another container or reach the Docker
+#     daemon directly: plain `docker` stays gated, and this wrapper hardcodes
+#     `docker exec <session-box>`. All agent-supplied words are the inner command and
+#     its arguments (they sit after the container name), never `docker exec` options,
+#     so `--privileged`-style injection into the exec itself is not possible.
+#   - Runs the inner command at the host's $PWD (same absolute path inside the box),
+#     so `runbox curl -o ./file URL` lands in the project tree.
+#   - Installed on PATH where the sandbox cannot write; granted no-ask by the Research
+#     settings' `Bash(runbox)` / `Bash(runbox *)` allow rules. Codex helpers explicitly
+#     forward to the launcher dispatcher when shell PATH ordering resolves this file.
+#   - Invoke standalone. Claude Code matches each pipeline segment independently, so
+#     `runbox … | other` runs `other` ungranted and crosses the target gate. To pipe,
+#     keep the whole pipeline inside the box: `runbox sh -c 'a | b'`.
+set -euo pipefail
+
+codex_helper_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+codex_dispatch_client="$codex_helper_dir/codex-dispatch-client.sh"
+if [ -f "$codex_dispatch_client" ]; then
+  # shellcheck source=/dev/null
+  . "$codex_dispatch_client"
+  codex_forward_helper_if_active "${BASH_SOURCE[0]##*/}" "$@"
+fi
+
+if { [ -n "${CODEX_SANDBOX:-}" ] || [ -n "${AGENTS_CODEX_MODE:-}" ]; } && [ "${AGENTS_CODEX_MODE:-}" != "research" ]; then
+  echo "runbox: available only in Codex Research mode" >&2
+  exit 2
+fi
+if [ -n "${AGENTS_CLAUDE_MODE:-}" ] && [ "$AGENTS_CLAUDE_MODE" != "research" ]; then
+  echo "runbox: available only in Claude Research mode" >&2
+  exit 2
+fi
+
+: "${RUNBOX_CONTAINER:?runbox: no session container; launch via claude-research (or another boxed launcher)}"
+
+if [ "$#" -lt 1 ]; then
+  echo "runbox: usage: runbox <command> [args...]" >&2
+  exit 2
+fi
+
+case "$RUNBOX_CONTAINER" in
+  agents-box-*)
+    ;;
+  *)
+    echo "runbox: refusing unexpected container name" >&2
+    exit 2
+    ;;
+esac
+case "$RUNBOX_CONTAINER" in
+  *[!A-Za-z0-9_-]*)
+    echo "runbox: refusing unexpected container name" >&2
+    exit 2
+    ;;
+esac
+
+find_docker() {
+  local candidate
+  for candidate in /opt/homebrew/bin/docker /usr/local/bin/docker /usr/bin/docker; do
+    [ -x "$candidate" ] && { printf '%s\n' "$candidate"; return 0; }
+  done
+  candidate="$(command -v docker 2>/dev/null || true)"
+  [ -n "$candidate" ] && [ "${candidate#/}" != "$candidate" ] && [ -x "$candidate" ] || return 1
+  case "$candidate" in
+    "$PWD"/*) return 1 ;;
+  esac
+  printf '%s\n' "$candidate"
+}
+
+set_docker_config() {
+  : "${AGENTS_DOCKER_CONFIG:=${TMPDIR:-/tmp}/agents-modes-empty-docker-config}"
+  mkdir -p "$AGENTS_DOCKER_CONFIG"
+  export DOCKER_CONFIG="$AGENTS_DOCKER_CONFIG"
+  [ -n "${DOCKER_HOST:-}" ] && return 0
+  local socket
+  for socket in \
+    "${AGENTS_DOCKER_SOCKET:-}" \
+    "$HOME/.docker/run/docker.sock" \
+    "$HOME/Library/Containers/com.docker.docker/Data/docker-cli.sock" \
+    /var/run/docker.sock; do
+    [ -n "$socket" ] || continue
+    [ -S "$socket" ] || continue
+    export DOCKER_HOST="unix://$socket"
+    return 0
+  done
+}
+
+DOCKER_BIN="$(find_docker)" || {
+  echo "runbox: docker not found on a trusted absolute path" >&2
+  exit 1
+}
+set_docker_config
+
+# -i keeps stdin open (heredocs, `runbox jq . < file`); no -t, since the agent runs
+# non-interactively and a TTY request would fail without one.
+exec "$DOCKER_BIN" exec -i -w "$PWD" "$RUNBOX_CONTAINER" "$@"

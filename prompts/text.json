@@ -1,0 +1,65 @@
+{
+  "title": "# Agent permission mode: {display}",
+  "current_mode": "Your current agent permission mode is {display}.",
+  "codex_collaboration_suffix": " Codex's collaboration mode is separate and does not replace this permission mode.",
+  "command_outcomes": "Every ordinary shell command has exactly three possible outcomes. {auto} {prompt_deny} {prompt_accept}",
+  "access": "You can read {read_region} and write inside {write_region}. Secret paths and read-only policy surfaces are outside the no-ask region and require approval to access beyond that region.",
+  "read_regions": {
+    "workdir": "the launched project",
+    "host": "non-secret local files"
+  },
+  "write_regions": {
+    "workdir": "the workspace",
+    "workdir_plus": "the workspace and temp dirs"
+  },
+  "network": {
+    "any_sandboxed": "Network egress is open for sandboxed shell commands and web tools.",
+    "any_boxed": "Network egress is open through the granted boxed helper path and web tools; plain host-network commands prompt.",
+    "named": "Command network is off except through these read-only helper paths: {helpers}.",
+    "none": "Command network is off."
+  },
+  "mcp": {
+    "codex_granted": "The loaded MCP servers are the always-prompt run_as_user command carrier and these mode-granted servers: {servers}.",
+    "codex_none": "The always-prompt run_as_user command carrier is loaded; no mode-granted MCP servers are loaded.",
+    "claude_granted": "The only loaded MCP servers are: {servers}.",
+    "claude_none": "No MCP servers are loaded."
+  },
+  "integrations": {
+    "claude": [
+      "User, project, and local Claude settings are loaded temporarily; the user is responsible for ensuring that they contain no dangerous hooks, plugins, or other integrations.",
+      "Unlisted MCP servers and the Chrome integration remain disabled."
+    ],
+    "codex": [
+      "Inherited user-configurable settings, hooks, rules, plugins, apps, connectors, browser control, computer use, native image generation, and unlisted MCP servers are disabled."
+    ],
+    "authority": "Organization-managed policy remains authoritative and is outside the user-configurable mode matrix."
+  },
+  "helper_standalone": "Run granted helpers as standalone commands: no pipes (`|`), no `&&`/`||`/`;`, no command substitution, and no environment-variable prefix. Put chaining inside the helper command itself when the helper supports it.",
+  "automatic_item": {
+    "sandboxed": "sandboxed shell commands inside the mode's read/write/egress region",
+    "helper": "standalone `{helper}`",
+    "web": "web reads through the target's built-in web tools",
+    "mcp": "granted MCP tools",
+    "fallback": "local reads and edits inside the mode's configured region"
+  },
+  "prompt_item": {
+    "outside": "any shell command outside the no-ask region",
+    "compound_helper": "a granted helper used in a pipe or compound command",
+    "policy_write": "writes to read-only policy surfaces"
+  },
+  "rules": {
+    "automatic": "- Do not ask when running: {items}.",
+    "prompt": "- Prompt the user for: {items}, secret reads.",
+    "forbidden": "- Do not attempt: bypassing the permission layer, editing mode enforcement surfaces directly, or treating a plain failure as a denied permission prompt."
+  },
+  "boundary": {
+    "common": "Run no-ask commands directly. When a command is outside the no-ask region, prompt the user; if they accept, run the exact command as the user with the user's normal credentials and permissions.",
+    "codex_route": "For that prompted route, use tool_search to load run_as_user if it is not already exposed, then call the run_as_user MCP tool exactly once with the original command unchanged and the intended absolute working directory. The tool call itself presents the user with Allow or Cancel before any command child starts. Do not use shell additional permissions or sandbox_permissions=\"require_escalated\", and do not retry a cancelled call.",
+    "codex_denial": "Never treat a sandbox or OS denial such as `Operation not permitted`, `Permission denied`, a read-only filesystem error, or a network-denied error as a completed permission denial. If the command was outside the no-ask region or the denial says the sandbox blocked it, make one run_as_user call for the exact command and working directory.",
+    "claude_denial": "Never treat a sandbox or OS denial such as `Operation not permitted`, `Permission denied`, a read-only filesystem error, or a network-denied error as a completed permission denial. If the command was outside the no-ask region or the denial says the sandbox blocked it, ask the user for approval to rerun the exact same command outside the sandbox with the user's normal credentials and permissions."
+  },
+  "gaps": {
+    "heading": "Target-specific deviations:",
+    "item": "- {axis}: {status}."
+  }
+}

@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# sandbox-escape - shared project escape runner.
+#
+# This locked host wrapper is the granted command for project sandbox escapes:
+# it accepts one direct child of ./sandbox-escapes, validates that it is a regular
+# executable and not a symlink, then runs it outside the sandbox.
+set -euo pipefail
+
+codex_helper_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+codex_dispatch_client="$codex_helper_dir/codex-dispatch-client.sh"
+if [ -f "$codex_dispatch_client" ]; then
+  # shellcheck source=/dev/null
+  . "$codex_dispatch_client"
+  codex_forward_helper_if_active "${BASH_SOURCE[0]##*/}" "$@"
+fi
+
+fail() {
+  echo "sandbox-escape: $*" >&2
+  exit 2
+}
+
+allowed=0
+if [ -n "${AGENTS_CODEX_MODE:-}" ]; then
+  case "$AGENTS_CODEX_MODE" in
+    sealed-development|development|networked-development) allowed=1 ;;
+    *) fail "available only in Sealed-development, Development, or Networked-development" ;;
+  esac
+fi
+if [ -n "${AGENTS_CLAUDE_MODE:-}" ]; then
+  case "$AGENTS_CLAUDE_MODE" in
+    sealed-development|development|networked-development) allowed=1 ;;
+    *) fail "available only in Sealed-development, Development, or Networked-development" ;;
+  esac
+fi
+[ "$allowed" -eq 1 ] || fail "launch an agent permission mode before using project escapes"
+
+[ "$#" -ge 1 ] || fail "usage: sandbox-escape <name|./sandbox-escapes/name> [args...]"
+
+name="$1"
+shift
+
+case "$name" in
+  ./sandbox-escapes/*)
+    name="${name#./sandbox-escapes/}"
+    ;;
+  sandbox-escapes/*)
+    name="${name#sandbox-escapes/}"
+    ;;
+esac
+
+case "$name" in
+  ""|"."|".."|*/*|*[$'\n\r\t ']*|-*)
+    fail "escape name must be one direct child of sandbox-escapes/"
+    ;;
+esac
+
+root="./sandbox-escapes"
+[ -d "$root" ] || fail "no sandbox-escapes/ directory in the current project"
+[ ! -L "$root" ] || fail "sandbox-escapes/ must not be a symlink"
+
+root_real="$(cd "$root" && pwd -P)" || fail "could not resolve sandbox-escapes/"
+target="$root_real/$name"
+
+[ -e "$target" ] || fail "escape not found: $name"
+stat_id() {
+  if stat -f '%d:%i:%p' "$1" >/dev/null 2>&1; then
+    stat -f '%d:%i:%p' "$1"
+  else
+    stat -c '%d:%i:%f' "$1"
+  fi
+}
+
+before="$(stat_id "$target")"
+[ -f "$target" ] || fail "escape is not a regular file: $name"
+[ ! -L "$target" ] || fail "escape must not be a symlink: $name"
+[ -x "$target" ] || fail "escape is not executable: $name"
+after="$(stat_id "$target")"
+[ "$before" = "$after" ] || fail "escape changed during validation: $name"
+
+exec "$target" "$@"

@@ -1,0 +1,187 @@
+#!/usr/bin/env python3
+"""Mode-scoped helper dispatcher for Codex launchers.
+
+Launchers expose small sandbox-visible shims on PATH; each shim writes a request into
+this private directory, and this host process runs only the helper names allowed for
+the active mode.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import pathlib
+import re
+import signal
+import stat
+import subprocess
+import sys
+import time
+
+
+REQUEST_BASE = re.compile(r"^request\.[0-9]+\.[0-9]+\.[0-9]+$")
+SAFE_BASE = re.compile(r"^request\.[A-Za-z0-9_.-]+$")
+NOFOLLOW = getattr(os, "O_NOFOLLOW", None)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dir", required=True)
+    parser.add_argument("--mode", required=True)
+    parser.add_argument("--helper-dir", required=True)
+    parser.add_argument("--workdir", required=True)
+    parser.add_argument("--helpers", nargs="+", required=True)
+    return parser.parse_args()
+
+
+def open_regular_at(dir_fd: int, name: str, flags: int) -> int:
+    if NOFOLLOW is None:
+        raise RuntimeError("O_NOFOLLOW is required for dispatch request files")
+    fd = os.open(name, flags | NOFOLLOW, dir_fd=dir_fd)
+    try:
+        mode = os.fstat(fd).st_mode
+        if not stat.S_ISREG(mode):
+            raise ValueError(f"not a regular file: {name}")
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def read_bytes_at(dir_fd: int, name: str) -> bytes:
+    fd = open_regular_at(dir_fd, name, os.O_RDONLY)
+    try:
+        chunks = []
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def read_text_at(dir_fd: int, name: str) -> str:
+    return read_bytes_at(dir_fd, name).decode("utf-8")
+
+
+def write_bytes_at(dir_fd: int, name: str, data: bytes) -> None:
+    tmp = f".{name}.tmp.{os.getpid()}.{time.monotonic_ns()}"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | NOFOLLOW, 0o600, dir_fd=dir_fd)
+    try:
+        view = memoryview(data)
+        while view:
+            written = os.write(fd, view)
+            view = view[written:]
+    except Exception:
+        try:
+            os.unlink(tmp, dir_fd=dir_fd)
+        except OSError:
+            pass
+        raise
+    finally:
+        os.close(fd)
+    os.rename(tmp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+
+
+def write_text_at(dir_fd: int, name: str, data: str) -> None:
+    write_bytes_at(dir_fd, name, data.encode("utf-8"))
+
+
+def reject_request(dir_fd: int, base: str, message: str) -> None:
+    write_bytes_at(dir_fd, f"{base}.stdout", b"")
+    write_text_at(dir_fd, f"{base}.stderr", f"codex-helper-dispatch: {message}\n")
+    write_text_at(dir_fd, f"{base}.status", "2\n")
+    write_bytes_at(dir_fd, f"{base}.done", b"")
+
+
+def handle_request(
+    dir_fd: int,
+    base: str,
+    helper_dir: pathlib.Path,
+    workdir: pathlib.Path,
+    allowed: set[str],
+    mode: str,
+) -> None:
+    helper = read_text_at(dir_fd, f"{base}.helper")
+    if helper not in allowed:
+        reject_request(dir_fd, base, f"helper not allowed in {mode}: {helper}")
+        return
+
+    helper_path = helper_dir / helper
+    if not helper_path.is_file() or not os.access(helper_path, os.X_OK):
+        reject_request(dir_fd, base, f"installed helper missing or not executable: {helper_path}")
+        return
+
+    cwd = pathlib.Path(read_text_at(dir_fd, f"{base}.cwd")).resolve(strict=True)
+    if cwd != workdir and workdir not in cwd.parents:
+        reject_request(dir_fd, base, f"working directory is outside the launched project: {cwd}")
+        return
+    raw_args = read_bytes_at(dir_fd, f"{base}.args")
+    args = raw_args.split(b"\0")
+    if args and args[-1] == b"":
+        args = args[:-1]
+    argv = [str(helper_path), *[arg.decode("utf-8", errors="surrogateescape") for arg in args]]
+
+    env = os.environ.copy()
+    env["AGENTS_CODEX_MODE"] = mode
+    env["AGENTS_CODEX_DISPATCH_HOST"] = "1"
+    env["PATH"] = f"{helper_dir}:{env.get('PATH', '')}"
+
+    try:
+        completed = subprocess.run(argv, cwd=str(cwd), env=env, capture_output=True, check=False)
+        write_bytes_at(dir_fd, f"{base}.stdout", completed.stdout)
+        write_bytes_at(dir_fd, f"{base}.stderr", completed.stderr)
+        write_text_at(dir_fd, f"{base}.status", f"{completed.returncode}\n")
+    except Exception as exc:  # pragma: no cover - exercised by shell tests as stderr text
+        write_bytes_at(dir_fd, f"{base}.stdout", b"")
+        write_text_at(dir_fd, f"{base}.stderr", f"codex-helper-dispatch: {exc}\n")
+        write_text_at(dir_fd, f"{base}.status", "1\n")
+    write_bytes_at(dir_fd, f"{base}.done", b"")
+
+
+def main() -> int:
+    args = parse_args()
+    dispatch_dir = pathlib.Path(args.dir)
+    helper_dir = pathlib.Path(args.helper_dir)
+    workdir = pathlib.Path(args.workdir).resolve(strict=True)
+    allowed = set(args.helpers)
+    dispatch_fd = os.open(dispatch_dir, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    stop = False
+
+    def stop_now(_signum: int, _frame: object) -> None:
+        nonlocal stop
+        stop = True
+
+    signal.signal(signal.SIGTERM, stop_now)
+    signal.signal(signal.SIGINT, stop_now)
+
+    try:
+        while not stop:
+            for ready_name in sorted(n for n in os.listdir(dispatch_fd) if n.endswith(".ready")):
+                base = ready_name[: -len(".ready")]
+                try:
+                    os.unlink(ready_name, dir_fd=dispatch_fd)
+                except FileNotFoundError:
+                    continue
+                if not SAFE_BASE.fullmatch(base):
+                    continue
+                if not REQUEST_BASE.fullmatch(base):
+                    reject_request(dispatch_fd, base, f"invalid request: unexpected request name: {base}")
+                    continue
+                try:
+                    handle_request(dispatch_fd, base, helper_dir, workdir, allowed, args.mode)
+                except Exception as exc:
+                    try:
+                        reject_request(dispatch_fd, base, f"invalid request: {exc}")
+                    except OSError:
+                        pass
+            time.sleep(0.05)
+        return 0
+    finally:
+        os.close(dispatch_fd)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

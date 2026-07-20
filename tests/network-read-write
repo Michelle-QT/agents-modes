@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+marker="$1"
+get_body="$(curl -fsSL --max-time 15 https://example.com/)"
+grep -Fq 'Example Domain' <<< "$get_body"
+
+post_ok=0
+for endpoint in \
+  https://httpbingo.org/anything \
+  https://postman-echo.com/post \
+  https://httpbin.org/anything; do
+  if post_body="$(curl -fsSL --connect-timeout 5 --max-time 10 -X POST --data 'agents-modes-live-web-write' "$endpoint")" \
+    && grep -Fq 'agents-modes-live-web-write' <<< "$post_body"; then
+    post_ok=1
+    break
+  fi
+done
+[ "$post_ok" = "1" ] || { printf 'no HTTP echo endpoint accepted the POST probe\n' >&2; exit 1; }
+printf 'network-read-write' > "$marker"

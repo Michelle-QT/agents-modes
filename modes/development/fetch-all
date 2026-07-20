@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+# fetch-all — the single network-enabled command for Development mode.
+#
+# Development mode runs every command inside the OS sandbox, which blocks all network
+# egress. This script is the one deliberate exception: it is named in the mode's
+# `sandbox.excludedCommands`, so it runs OUTSIDE the sandbox and can reach the
+# network (https or ssh remotes alike). Everything else the agent runs stays
+# sandboxed and offline, so `git push` and general web access are blocked by the
+# sandbox itself, not by string matching.
+#
+# Contract (keep these properties; they are what make the escape safe):
+#   - Read-only toward remotes: fetch only. Never push, pull, or check out.
+#   - No arguments: the agent selects the repo by its working directory, never by
+#     passing a path. That keeps the excluded command an exact, un-injectable
+#     token ("fetch-all") rather than a prefix that could carry extra words.
+#   - Installed on PATH somewhere the sandbox cannot write (e.g. ~/.local/bin),
+#     so a sandboxed agent cannot modify this script's behavior.
+set -euo pipefail
+
+codex_helper_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+codex_dispatch_client="$codex_helper_dir/codex-dispatch-client.sh"
+if [ -f "$codex_dispatch_client" ]; then
+  # shellcheck source=/dev/null
+  . "$codex_dispatch_client"
+  codex_forward_helper_if_active "${BASH_SOURCE[0]##*/}" "$@"
+fi
+
+deny() {
+  echo "fetch-all: $*" >&2
+  exit 2
+}
+
+if { [ -n "${CODEX_SANDBOX:-}" ] || [ -n "${AGENTS_CODEX_MODE:-}" ]; } && [ "${AGENTS_CODEX_MODE:-}" != "development" ]; then
+  deny "available only in Codex Development mode"
+fi
+if [ -n "${AGENTS_CLAUDE_MODE:-}" ] && [ "$AGENTS_CLAUDE_MODE" != "development" ]; then
+  deny "available only in Claude Development mode"
+fi
+
+if [ "$#" -ne 0 ]; then
+  deny "takes no arguments; cd into the repository you want to fetch"
+fi
+
+find_git() {
+  local candidate
+  for candidate in /opt/homebrew/bin/git /usr/bin/git; do
+    [ -x "$candidate" ] && { printf '%s\n' "$candidate"; return 0; }
+  done
+  candidate="$(command -v git 2>/dev/null || true)"
+  [ -n "$candidate" ] && [ "${candidate#/}" != "$candidate" ] && [ -x "$candidate" ] || return 1
+  case "$candidate" in
+    "$PWD"/*) return 1 ;;
+  esac
+  printf '%s\n' "$candidate"
+}
+
+clear_git_env() {
+  local name
+  while IFS='=' read -r name _; do
+    case "$name" in
+      GIT_CONFIG_*|GIT_TRACE*|GIT_SSH|GIT_SSH_COMMAND|GIT_ASKPASS|SSH_ASKPASS|GIT_PROXY_COMMAND)
+        unset "$name"
+        ;;
+    esac
+  done < <(env)
+  export GIT_TERMINAL_PROMPT=0
+}
+
+validate_remote_url() {
+  local remote="$1"
+  local url="$2"
+  case "$url" in
+    ""|*[$'\n\r\t ']*|-*|ext::*|file://*|/*|./*|../*|~/*)
+      deny "refusing unsafe URL for remote '$remote'"
+      ;;
+    http://-*|https://-*|ssh://-*|git://-*)
+      deny "refusing option-like host in URL for remote '$remote'"
+      ;;
+    http://*|https://*|ssh://*|git://*|*@*:*)
+      return 0
+      ;;
+    *)
+      deny "refusing unsupported URL scheme for remote '$remote'"
+      ;;
+  esac
+}
+
+GIT_BIN="$(find_git)" || deny "git not found on a trusted absolute path"
+clear_git_env
+git_cmd=(
+  "$GIT_BIN"
+  -c core.hooksPath=/dev/null
+  -c protocol.allow=never
+  -c protocol.http.allow=always
+  -c protocol.https.allow=always
+  -c protocol.ssh.allow=always
+  -c protocol.git.allow=always
+)
+
+if ! "${git_cmd[@]}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  echo "fetch-all: not inside a git repository (cd into one first)" >&2
+  exit 1
+fi
+
+root="$("${git_cmd[@]}" rev-parse --show-toplevel)"
+echo "fetch-all: fetching all remotes for $root" >&2
+
+while IFS= read -r remote; do
+  [ -n "$remote" ] || continue
+  case "$remote" in
+    -*|*[$'\n\r\t ']*)
+      deny "refusing unsafe remote name '$remote'"
+      ;;
+  esac
+  validate_remote_url "$remote" "$("${git_cmd[@]}" remote get-url "$remote" 2>/dev/null)"
+done < <("${git_cmd[@]}" remote)
+
+# Update every configured remote: refresh remote-tracking refs and tags, and
+# prune refs that disappeared upstream. This touches no local branch or working
+# tree, so it is non-destructive to the agent's review state.
+exec "${git_cmd[@]}" fetch --all --prune --tags --no-recurse-submodules

@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# Generic Claude mode launcher. The installed basename selects a generated mode manifest.
+set -euo pipefail
+
+launcher="${0##*/}"
+case "$launcher" in
+  claude-?*) mode="${launcher#claude-}" ;;
+  *) echo "claude-mode: install or invoke this as claude-<mode>" >&2; exit 2 ;;
+esac
+
+settings_dir="${CLAUDE_MODES_DIR:-$HOME/.local/share/claude-modes}"
+agents_dir="${AGENTS_MODES_DIR:-$HOME/.local/share/agents-modes}"
+container_dir="${AGENTS_CONTAINER_DIR:-$agents_dir/container}"
+helper_dir="$(cd "$(dirname "$0")" && pwd -P)"
+settings="$settings_dir/$mode.json"
+mcp_config="$settings_dir/$mode.mcp.json"
+manifest="$agents_dir/modes/$mode.json"
+prompt="$agents_dir/prompts/claude/$mode.prompt.md"
+settings_lib="$helper_dir/claude-launcher-settings.sh"
+boxlib="$container_dir/boxlib.sh"
+
+[ -f "$settings" ] || { echo "$launcher: settings not found at $settings (run 'make install')" >&2; exit 1; }
+[ -f "$mcp_config" ] || { echo "$launcher: MCP config not found at $mcp_config (run 'make install')" >&2; exit 1; }
+[ -f "$manifest" ] || { echo "$launcher: mode manifest not found at $manifest (run 'make install')" >&2; exit 1; }
+[ -f "$prompt" ] || { echo "$launcher: prompt not found at $prompt (run 'make install')" >&2; exit 1; }
+[ -f "$settings_lib" ] || { echo "$launcher: settings helper not found at $settings_lib (run 'make install')" >&2; exit 1; }
+jq -e --arg mode "$mode" '.slug == $mode and (.needs_container | type == "boolean")' "$manifest" >/dev/null \
+  || { echo "$launcher: invalid or mismatched mode manifest at $manifest" >&2; exit 1; }
+needs_container="$(jq -r '.needs_container' "$manifest")"
+[ "$needs_container" = "false" ] || [ -f "$boxlib" ] \
+  || { echo "$launcher: box lifecycle not found at $boxlib (run 'make install')" >&2; exit 1; }
+
+# shellcheck source=/dev/null
+. "$settings_lib"
+claude_validate_mode_args "$@"
+claude_prepare_session_settings "$settings" session_settings "$settings_dir" "$agents_dir" "$helper_dir"
+
+appended="$(
+  cat "$prompt"
+  printf '\n\n---\n\n## Your exact permission configuration\n\n'
+  printf 'The JSON below is the settings file that enforces the summary above. It is the source of truth: if it and the summary disagree, the JSON wins.\n\n'
+  printf '```json\n'
+  printf '%s\n' "$session_settings"
+  printf '\n```\n'
+)"
+claude_args=(
+  --settings "$session_settings"
+  --mcp-config "$mcp_config"
+  --strict-mcp-config
+  --no-chrome
+  --append-system-prompt "$appended"
+  --append-subagent-system-prompt "$(cat "$prompt")"
+)
+if [ "$claude_mode_resume" = "1" ]; then
+  claude_args+=(--fork-session)
+fi
+
+if [ "$needs_container" = "true" ]; then
+  export AGENTS_CONTAINER_DIR="$container_dir"
+  # shellcheck source=/dev/null
+  . "$boxlib"
+  box_start
+  trap box_stop EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  claude "${claude_args[@]}" "$@"
+  exit $?
+fi
+
+exec claude "${claude_args[@]}" "$@"

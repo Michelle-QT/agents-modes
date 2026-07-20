@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# Generic Codex mode launcher. The installed basename selects a generated mode manifest.
+set -euo pipefail
+
+launcher="${0##*/}"
+case "$launcher" in
+  codex-?*) mode="${launcher#codex-}" ;;
+  *) echo "codex-mode: install or invoke this as codex-<mode>" >&2; exit 2 ;;
+esac
+
+profile="agents-$mode"
+dir="${AGENTS_MODES_DIR:-$HOME/.local/share/agents-modes}"
+container_dir="${AGENTS_CONTAINER_DIR:-$dir/container}"
+helper_dir="$(cd "$(dirname "$0")" && pwd -P)"
+profile_file="$dir/codex/profiles/$profile.config.toml"
+session_config="$dir/codex/config/$mode.config.toml"
+rules_file="$dir/codex/rules/agents-modes.rules"
+manifest="$dir/modes/$mode.json"
+prompt="$dir/prompts/codex/$mode.prompt.md"
+boxlib="$container_dir/boxlib.sh"
+dispatch_lib="$helper_dir/codex-launcher-dispatch.sh"
+session_lib="$helper_dir/codex-launcher-session.sh"
+
+[ -f "$profile_file" ] || { echo "$launcher: profile not found at $profile_file (run 'make codex')" >&2; exit 1; }
+[ -f "$session_config" ] || { echo "$launcher: session config not found at $session_config (run 'make codex')" >&2; exit 1; }
+[ -f "$rules_file" ] || { echo "$launcher: rules not found at $rules_file (run 'make codex')" >&2; exit 1; }
+[ -f "$manifest" ] || { echo "$launcher: mode manifest not found at $manifest (run 'make codex')" >&2; exit 1; }
+[ -f "$prompt" ] || { echo "$launcher: prompt not found at $prompt (run 'make codex')" >&2; exit 1; }
+[ -f "$dispatch_lib" ] || { echo "$launcher: dispatcher library not found at $dispatch_lib (run 'make codex')" >&2; exit 1; }
+[ -f "$session_lib" ] || { echo "$launcher: session library not found at $session_lib (run 'make codex')" >&2; exit 1; }
+jq -e --arg mode "$mode" '.slug == $mode and (.needs_container | type == "boolean") and (.codex_run_as_user.executable | type == "string" and length > 0)' "$manifest" >/dev/null \
+  || { echo "$launcher: invalid or mismatched mode manifest at $manifest" >&2; exit 1; }
+needs_container="$(jq -r '.needs_container' "$manifest")"
+run_as_user_executable="$(jq -r '.codex_run_as_user.executable' "$manifest")"
+[ "$needs_container" = "false" ] || [ -f "$boxlib" ] \
+  || { echo "$launcher: box lifecycle not found at $boxlib (run 'make codex')" >&2; exit 1; }
+
+export AGENTS_CODEX_MODE="$mode"
+# shellcheck source=/dev/null
+. "$dispatch_lib"
+# shellcheck source=/dev/null
+. "$session_lib"
+if [ "${1:-}" = "diagnose-sandbox" ]; then
+  [ "$#" -eq 1 ] || {
+    printf 'codex mode launcher: diagnose-sandbox takes no arguments\n' >&2
+    exit 2
+  }
+  codex_diagnose_sandbox \
+    "$mode" "$profile" "$profile_file" "$session_config" "$rules_file" "$helper_dir" \
+    "$run_as_user_executable"
+  exit
+fi
+codex_validate_mode_args "$@"
+
+if [ "$needs_container" = "true" ]; then
+  export AGENTS_CONTAINER_DIR="$container_dir"
+  # shellcheck source=/dev/null
+  . "$boxlib"
+fi
+cleanup() {
+  local status=$?
+  codex_stop_helper_dispatch
+  codex_stop_mode_session
+  if [ "$needs_container" = "true" ]; then
+    box_stop
+  fi
+  return "$status"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+codex_start_mode_session \
+  "$mode" "$profile" "$profile_file" "$session_config" "$rules_file" "$helper_dir" \
+  "$run_as_user_executable"
+if [ "$needs_container" = "true" ]; then
+  box_start
+fi
+codex_start_helper_dispatch "$mode" "$helper_dir"
+
+appended="$(
+  cat "$prompt"
+  printf '\n\n---\n\n## Your exact isolated Codex configuration\n\n'
+  printf 'The TOML below is the per-session profile and generated mode-config template layered over the incoming user config. The private rendered run_as_user executable and environment-snapshot paths are omitted. The launched project is untrusted for configuration purposes, so project .codex config, hooks, and rules are not loaded.\n\n'
+  printf '```toml\n'
+  cat "$codex_session_profile_file"
+  printf '\n'
+  cat "$session_config"
+  printf '\n```\n'
+)"
+appended_toml="$(codex_toml_string "$appended")"
+if [ "${1:-}" = "exec" ]; then
+  shift
+  codex --add-dir "$codex_dispatch_dir" --profile "$profile" "${codex_mode_config_args[@]}" --config "developer_instructions=$appended_toml" exec "$@"
+  exit $?
+fi
+if [ "${1:-}" = "debug" ]; then
+  shift
+  codex --add-dir "$codex_dispatch_dir" --profile "$profile" "${codex_mode_config_args[@]}" --config "developer_instructions=$appended_toml" debug "$@"
+  exit $?
+fi
+codex --add-dir "$codex_dispatch_dir" --profile "$profile" "${codex_mode_config_args[@]}" --config "developer_instructions=$appended_toml" "$@"
