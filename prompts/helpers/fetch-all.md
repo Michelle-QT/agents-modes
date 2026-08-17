@@ -1,0 +1,1 @@
+`fetch-all` is the only no-ask way to reach a remote. It runs outside the sandbox, is read-only toward remotes (it runs `git fetch --all --prune --tags`), and takes no arguments: `cd` into the target repository, then run `fetch-all`. Use it and nothing else to sync remote refs. A plain `git fetch`, `git pull`, or `clone` is gated.

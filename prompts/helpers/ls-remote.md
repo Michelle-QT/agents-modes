@@ -1,0 +1,1 @@
+`ls-remote` prints the current branch's remote refs (`git ls-remote`) without mutating anything locally: use it to read the live SHAs of remote heads without fetching. It runs outside the sandbox and takes no arguments: `cd` into the target repository, then run `ls-remote`. A plain `git ls-remote` is gated.

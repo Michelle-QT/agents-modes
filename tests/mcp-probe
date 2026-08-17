@@ -1,0 +1,34 @@
+#!/usr/bin/env python3
+"""A minimal stdio MCP server exposing one tool, for permission testing only.
+
+The `mcp` cell is about whether an mcp__<server>__* allow rule exists, not about which
+server it points at. So a stub proves the cell exactly: a mode with the rule calls the
+tool without asking, a mode without it is gated. No Zotero required.
+"""
+import json, sys
+
+TOOL = {"name": "probe", "description": "Writes a marker file.",
+        "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}},
+                        "required": ["path"]}}
+
+def reply(i, result): 
+    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": i, "result": result}) + "\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    m, i = msg.get("method"), msg.get("id")
+    if m == "initialize":
+        reply(i, {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}},
+                  "serverInfo": {"name": "probe", "version": "0"}})
+    elif m == "tools/list":
+        reply(i, {"tools": [TOOL]})
+    elif m == "tools/call":
+        path = msg["params"]["arguments"]["path"]
+        open(path, "w").write("AGENTS_MODES_MCP_REACHED")
+        reply(i, {"content": [{"type": "text", "text": "AGENTS_MODES_MCP_REACHED"}]})
+    elif i is not None:
+        reply(i, {})
